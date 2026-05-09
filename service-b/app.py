@@ -1,81 +1,46 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import redis
 import logging
-import random
+import requests
 import time
+import random
 
 app = FastAPI()
 
-# -----------------------
-# Logging setup
-# -----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("service-b")
 
-# -----------------------
-# Redis connection
-# -----------------------
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-# -----------------------
-# Health endpoint
-# -----------------------
-@app.get("/health")
-def health():
-    logger.info("Health check called")
-    return {"status": "ok", "service": "service-b"}
-
-
-# -----------------------
-# Core processing endpoint
-# -----------------------
 @app.get("/process/{request_id}")
-def process(request_id: str):
+def process(request_id: str, request: Request):
 
-    logger.info(f"Received request: {request_id}")
+    trace_id = request.headers.get("X-Trace-ID")
+    logger.info(f"[TRACE={trace_id}] Service [B] START {request_id}")
 
-    # mark state in Redis
-    r.set(f"workflow:{request_id}", "PROCESSING")
-    logger.info(f"Redis updated: workflow:{request_id} -> PROCESSING")
+    r.set(f"workflow:{request_id}", "PROCESSING_B")
 
-    # simulate latency
-    delay = random.randint(0, 5)
-    logger.info(f"Simulating processing delay: {delay}s")
-    time.sleep(delay)
+    time.sleep(random.randint(1, 2))
 
-    # simulate failure scenarios
-    failure_roll = random.randint(1, 10)
+    try:
+        response = requests.get(
+            f"http://service-c:8000/process/{request_id}",
+             headers={
+                "X-Trace-ID": trace_id
+            },
+            timeout=10
+        )
 
-    if failure_roll >= 9:
+        logger.info(f"[TRACE={trace_id}] Service [B] Service C response: {response.json()}")
+
+    except Exception as e:
+        logger.error(f"[TRACE={trace_id}] Service [B] error: {str(e)}")
         r.set(f"workflow:{request_id}", "FAILED")
-        logger.error(f"Processing FAILED for {request_id}")
+        return {"status": "FAILED"}
 
-        return {
-            "request_id": request_id,
-            "status": "FAILED",
-            "reason": "downstream processing error"
-        }
-
-    elif failure_roll >= 7:
-        r.set(f"workflow:{request_id}", "DEGRADED")
-        logger.warning(f"Processing DEGRADED for {request_id}")
-
-        return {
-            "request_id": request_id,
-            "status": "DEGRADED",
-            "reason": "slow processing"
-        }
-
-    # success path
-    r.set(f"workflow:{request_id}", "COMPLETED")
-    logger.info(f"Processing COMPLETED for {request_id}")
-
+    logger.info(f"[TRACE={trace_id}] Service [B] COMPLETED {request_id}")
     return {
         "request_id": request_id,
-        "status": "COMPLETED"
+        "status": "OK"
     }

@@ -1,23 +1,17 @@
-from fastapi import FastAPI
-import logging
+from fastapi import FastAPI, Request
 import redis
+import logging
 import uuid
 import requests
 import time
 
-# -----------------------
-# Logging setup
-# -----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-
-logger = logging.getLogger("service-a")
-
 app = FastAPI()
 
-# Redis connection
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("service-a")
+
+trace_id = str(uuid.uuid4())
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
@@ -26,46 +20,33 @@ def work():
 
     request_id = str(uuid.uuid4())
 
-    logger.info(f"[START] request_id={request_id}")
+    logger.info(f"[A] START {request_id}")
 
-    # 1. initial state
-    r.set(f"workflow:{request_id}", "RECEIVED")
-    logger.info(f"Redis state -> RECEIVED ({request_id})")
+    # initial state only
+    r.set(f"workflow:{request_id}", "PROCESSING_A")
 
-    # 2. simulate small processing delay
     time.sleep(1)
 
-    # 3. call service-b (dependency)
     try:
-        logger.info(f"Calling service-b for request_id={request_id}")
-
         response = requests.get(
-            f"http://service-b:8000/process/{request_id}",
+        f"http://service-b:8000/process/{request_id}",
+        headers={
+            "X-Trace-ID": trace_id
+            },
             timeout=10
         )
 
-        logger.info(
-            f"service-b response: request_id={request_id}, status={response.json()}"
-        )
+        logger.info(f"[TRACE={trace_id}] Service[A] Service B response: {response.json()}")
 
     except Exception as e:
-        logger.error(f"service-b call failed: {str(e)}")
-
+        logger.error(f"[TRACE={trace_id}] Service [A] error: {str(e)}")
         r.set(f"workflow:{request_id}", "FAILED")
+        return {"status": "FAILED"}
 
-        return {
-            "request_id": request_id,
-            "status": "FAILED",
-            "reason": "service-b unreachable"
-        }
-
-    # 4. final state update based on service-b response
-    r.set(f"workflow:{request_id}", "DELEGATED_TO_B")
-
-    logger.info(f"[END] request_id={request_id}")
+    # IMPORTANT: DO NOT mark completed here anymore
+    logger.info(f"[TRACE={trace_id}] Service[A] forwarded workflow {request_id}")
 
     return {
         "request_id": request_id,
-        "status": "delegated",
-        "service_b_result": response.json()
+        "status": "IN_PROGRESS"
     }

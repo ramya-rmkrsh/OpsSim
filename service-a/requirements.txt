@@ -4,3 +4,4 @@ redis
 requests
 logging
 pika
+psycopg2-binary

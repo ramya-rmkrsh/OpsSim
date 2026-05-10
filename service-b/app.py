@@ -5,6 +5,7 @@ import json
 import time
 import random
 from datetime import datetime
+import psycopg2
 
 # ----------------------------
 # Logging
@@ -27,6 +28,18 @@ r = redis.Redis(
 )
 
 # ----------------------------
+# Postgres Connection
+# ----------------------------
+def get_db_connection():
+
+    return psycopg2.connect(
+        host="postgres",
+        database="opssim",
+        user="opsuser",
+        password="opspassword"
+    )
+
+# ----------------------------
 # Structured Logging
 # ----------------------------
 def log_event(level, trace_id, request_id, state, message):
@@ -42,6 +55,36 @@ def log_event(level, trace_id, request_id, state, message):
 
     print(json.dumps(log_data), flush=True)
 
+# ----------------------------
+# Persist Workflow Event
+# ----------------------------
+def persist_event(trace_id, request_id, state, message):
+
+    conn = get_db_connection()
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO workflow_events (
+            trace_id,
+            request_id,
+            service_name,
+            state,
+            message
+        )
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        trace_id,
+        request_id,
+        "service-b",
+        state,
+        message
+    ))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
 
 # ----------------------------
 # RabbitMQ Connection Retry
@@ -97,6 +140,14 @@ def callback(ch, method, properties, body):
     # update redis state
     r.set(f"workflow:{request_id}", "PROCESSING_B")
 
+    # persist event to Postgres
+    persist_event(
+        trace_id,
+        request_id,
+        "PROCESSING_B",
+        "workflow consumed by service b"
+    )
+
     # simulate processing
     time.sleep(random.randint(1, 4))
 
@@ -113,6 +164,14 @@ def callback(ch, method, properties, body):
             message="processing failed in service-b"
         )
 
+        # persist event to Postgres
+        persist_event(
+            trace_id,
+            request_id,
+            "FAILED_B",
+            "workflow failed in service b"
+        )
+
         return
 
     # completed processing in B
@@ -126,6 +185,14 @@ def callback(ch, method, properties, body):
         message="processing completed in service-b"
     )
 
+    # persist event to Postgres
+    persist_event(
+        trace_id,
+        request_id,
+        "COMPLETED_B",
+        "workflow completed in service b"
+    )
+    
     # publish to next queue
     next_message = {
         "trace_id": trace_id,
@@ -148,6 +215,13 @@ def callback(ch, method, properties, body):
         message="event published to workflow_queue_c"
     )
 
+    # persist event to Postgres
+    persist_event(
+        trace_id,
+        request_id,
+        "PUBLISHED_TO_C",
+        "workflow published to workflow_queue_c"
+    )
 
 # ----------------------------
 # Start Consumer

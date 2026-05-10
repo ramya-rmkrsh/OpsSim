@@ -6,6 +6,7 @@ import time
 import random
 from datetime import datetime
 import psycopg2
+import requests
 
 # ----------------------------
 # Logging
@@ -118,33 +119,6 @@ channel.queue_declare(queue="workflow_queue_c")
 
 
 # ----------------------------
-# Create workflow_events table
-# ----------------------------
-conn = get_db_connection()
-
-cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS workflow_events (
-    id SERIAL PRIMARY KEY,
-    trace_id TEXT,
-    request_id TEXT,
-    service_name TEXT,
-    state TEXT,
-    message TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-
-conn.commit()
-
-cur.close()
-conn.close()
-
-print("workflow_events table ready", flush=True)
-
-
-# ----------------------------
 # Consumer Callback
 # ----------------------------
 def callback(ch, method, properties, body):
@@ -161,49 +135,80 @@ def callback(ch, method, properties, body):
         state="PROCESSING_C",
         message="message consumed from workflow_queue_c"
     )
+    
+    # persist event to Postgres
+    persist_event(
+        trace_id,
+        request_id,
+        "PROCESSING_C",
+        "workflow consumed by workflow_queue_c"
+    )
 
     # update redis state
     r.set(f"workflow:{request_id}", "PROCESSING_C")
 
-    # simulate external processing
-    time.sleep(random.randint(2, 5))
+    # call external API
+    try: 
+        response = requests.get(
+            "http://external-api:8003/process",
+            params={"request_id": request_id},
+            timeout=2
+        )
 
-    # simulate occasional downstream failure
-    if random.randint(1, 10) > 8:
+        if response.status_code == 200 and response.json().get("status") == "SUCCESS":
 
-        r.set(f"workflow:{request_id}", "FAILED_C")
+            state_text="COMPLETED_C"
+            message_text="external API call succeeded"
+            log_level="info"
 
+        else:
+
+            state_text="FAILED_C"
+            message_text=f"external API call failed with status code {response.status_code}"
+            log_level="error"
+
+        r.set(f"workflow:{request_id}", state_text)
+            
         log_event(
-            level="error",
+            level=log_level,
             trace_id=trace_id,
             request_id=request_id,
-            state="FAILED_C",
-            message="external dependency failure in service-c"
+            state=state_text,
+            message=message_text
         )
 
         persist_event(
             trace_id,
             request_id,
-            "FAILED_C",
-            "external dependency failure in service-c"
+            state_text,
+            message_text
         )
+
+    except Exception as e:
+
+        r.set(f"workflow:{request_id}", "ERRORED_C")
+
+        log_event(
+            level="error",
+            trace_id=trace_id,
+            request_id=request_id,
+            state="ERRORED_C",
+            message=f"external API call failed: {str(e)}"
+        )
+
+        persist_event(
+            trace_id,
+            request_id,
+            "ERRORED_C",
+            f"external API call failed: {str(e)}"
+        )
+
         return
-
-    # mark completed
-    r.set(f"workflow:{request_id}", "COMPLETED")
-
-    log_event(
-        level="info",
-        trace_id=trace_id,
-        request_id=request_id,
-        state="COMPLETED",
-        message="workflow completed successfully"
-    )
-
+    
     # cleanup redis after completion
     time.sleep(2)
 
-    r.delete(f"workflow:{request_id}")
+    r.expire(f"workflow:{request_id}", 3600)
 
     log_event(
         level="info",
@@ -219,7 +224,8 @@ def callback(ch, method, properties, body):
         "COMPLETED",
         "workflow completed successfully"
     )
-
+    
+    return
 # ----------------------------
 # Start Consumer
 # ----------------------------

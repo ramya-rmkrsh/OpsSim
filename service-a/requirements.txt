@@ -3,3 +3,4 @@ uvicorn
 redis
 requests
 logging
+pika

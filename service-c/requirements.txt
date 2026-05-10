@@ -1,5 +1,4 @@
-fastapi
-uvicorn
 redis
 requests
 logging
+pika

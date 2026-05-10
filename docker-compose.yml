@@ -23,6 +23,11 @@ services:
     depends_on:
       - redis
 
+  external-api:
+    build: ./external-api
+    ports:
+      - "8004:8004"
+
   redis:
     image: redis:7
     ports:

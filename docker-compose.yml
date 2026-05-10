@@ -43,3 +43,21 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+
+  postgres:
+    image: postgres:15
+
+    environment:
+      POSTGRES_DB: opssim
+      POSTGRES_USER: opsuser
+      POSTGRES_PASSWORD: opspassword
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      
+volumes:
+  postgres_data:

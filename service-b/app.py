@@ -40,11 +40,7 @@ def log_event(level, trace_id, request_id, state, message):
         "message": message
     }
 
-    if level == "info":
-        logger.info(json.dumps(log_data, flush=True))
-
-    elif level == "error":
-        logger.error(json.dumps(log_data, flush=True))
+    print(json.dumps(log_data), flush=True)
 
 
 # ----------------------------

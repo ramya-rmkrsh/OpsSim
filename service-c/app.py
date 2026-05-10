@@ -5,6 +5,7 @@ import json
 import time
 import random
 from datetime import datetime
+import psycopg2
 
 # ----------------------------
 # Logging
@@ -16,6 +17,18 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("service-c")
+
+# ----------------------------
+# Postgres Connection
+# ----------------------------
+def get_db_connection():
+
+    return psycopg2.connect(
+        host="postgres",
+        database="opssim",
+        user="opsuser",
+        password="opspassword"
+    )
 
 # ----------------------------
 # Redis
@@ -40,11 +53,39 @@ def log_event(level, trace_id, request_id, state, message):
         "message": message
     }
 
-    if level == "info":
-        logger.info(json.dumps(log_data, flush=True))
+    print(json.dumps(log_data), flush=True)
 
-    elif level == "error":
-        logger.error(json.dumps(log_data, flush=True))
+
+# ----------------------------
+# Persist Workflow Event
+# ----------------------------
+def persist_event(trace_id, request_id, state, message):
+
+    conn = get_db_connection()
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO workflow_events (
+            trace_id,
+            request_id,
+            service_name,
+            state,
+            message
+        )
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        trace_id,
+        request_id,
+        "service-c",
+        state,
+        message
+    ))
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
 
 
 # ----------------------------
@@ -74,6 +115,33 @@ while connection is None:
 channel = connection.channel()
 
 channel.queue_declare(queue="workflow_queue_c")
+
+
+# ----------------------------
+# Create workflow_events table
+# ----------------------------
+conn = get_db_connection()
+
+cur = conn.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS workflow_events (
+    id SERIAL PRIMARY KEY,
+    trace_id TEXT,
+    request_id TEXT,
+    service_name TEXT,
+    state TEXT,
+    message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+conn.commit()
+
+cur.close()
+conn.close()
+
+print("workflow_events table ready", flush=True)
 
 
 # ----------------------------
@@ -113,6 +181,12 @@ def callback(ch, method, properties, body):
             message="external dependency failure in service-c"
         )
 
+        persist_event(
+            trace_id,
+            request_id,
+            "FAILED_C",
+            "external dependency failure in service-c"
+        )
         return
 
     # mark completed
@@ -139,6 +213,12 @@ def callback(ch, method, properties, body):
         message="redis workflow cache deleted"
     )
 
+    persist_event(
+        trace_id,
+        request_id,
+        "COMPLETED",
+        "workflow completed successfully"
+    )
 
 # ----------------------------
 # Start Consumer

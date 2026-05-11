@@ -41,6 +41,20 @@ r = redis.Redis(
 )
 
 # ----------------------------
+# Retry Config (NEW)
+# ----------------------------
+MAX_RETRIES = 3
+RETRY_KEY_PREFIX = "retry:"
+
+def get_retry_count(request_id):
+    return int(r.get(f"{RETRY_KEY_PREFIX}{request_id}") or 0)
+
+def increment_retry(request_id):
+    count = get_retry_count(request_id) + 1
+    r.set(f"{RETRY_KEY_PREFIX}{request_id}", count)
+    return count
+
+# ----------------------------
 # Structured Logging
 # ----------------------------
 def log_event(level, trace_id, request_id, state, message):
@@ -55,7 +69,6 @@ def log_event(level, trace_id, request_id, state, message):
     }
 
     print(json.dumps(log_data), flush=True)
-
 
 # ----------------------------
 # Persist Workflow Event
@@ -88,7 +101,6 @@ def persist_event(trace_id, request_id, state, message):
     cur.close()
     conn.close()
 
-
 # ----------------------------
 # RabbitMQ Connection Retry
 # ----------------------------
@@ -112,11 +124,22 @@ while connection is None:
 
         time.sleep(5)
 
-
 channel = connection.channel()
 
 channel.queue_declare(queue="workflow_queue_c")
 
+# ----------------------------
+# DLQ (NEW)
+# ----------------------------
+channel.queue_declare(queue="workflow_dlq")
+
+def send_to_dlq(message):
+
+    channel.basic_publish(
+        exchange="",
+        routing_key="workflow_dlq",
+        body=json.dumps(message)
+    )
 
 # ----------------------------
 # Consumer Callback
@@ -128,6 +151,9 @@ def callback(ch, method, properties, body):
     trace_id = message["trace_id"]
     request_id = message["request_id"]
 
+    # ----------------------------
+    # PROCESSING C
+    # ----------------------------
     log_event(
         level="info",
         trace_id=trace_id,
@@ -147,8 +173,73 @@ def callback(ch, method, properties, body):
     # update redis state
     r.set(f"workflow:{request_id}", "PROCESSING_C")
 
-    # call external API
-    try: 
+    # simulate processing delay
+    time.sleep(random.randint(1, 3))
+
+    # ----------------------------
+    # FAILURE SIMULATION (NEW)
+    # ----------------------------
+    should_fail = random.randint(1, 10) > 8
+
+    if should_fail:
+
+        retry_count = increment_retry(request_id)
+
+        r.set(f"workflow:{request_id}", "FAILED_C")
+
+        log_event(
+            level="error",
+            trace_id=trace_id,
+            request_id=request_id,
+            state="FAILED_C",
+            message=f"service-c failed (retry {retry_count}/{MAX_RETRIES})"
+        )
+
+        persist_event(
+            trace_id,
+            request_id,
+            "FAILED_C",
+            f"workflow failed in service b (retry {retry_count}/{MAX_RETRIES})"
+        )
+
+        # ----------------------------
+        # RETRY LOGIC (NEW)
+        # ----------------------------
+        if retry_count <= MAX_RETRIES:
+
+            log_event(
+                level="warning",
+                trace_id=trace_id,
+                request_id=request_id,
+                state="RETRY_C",
+                message=f"retrying service-c ({retry_count}/{MAX_RETRIES})"
+            )
+
+            channel.basic_publish(
+                exchange="",
+                routing_key="workflow_queue_c",
+                body=json.dumps(message)
+            )
+
+        else:
+
+            send_to_dlq(message)
+
+            log_event(
+                level="error",
+                trace_id=trace_id,
+                request_id=request_id,
+                state="DLQ_C",
+                message="max retries exceeded, sent to DLQ"
+            )
+
+        return
+
+    # ----------------------------
+    # EXTERNAL API CALL (SUCCESS PATH)
+    # ----------------------------
+    try:
+
         response = requests.get(
             "http://external-api:8003/process",
             params={"request_id": request_id},
@@ -157,57 +248,45 @@ def callback(ch, method, properties, body):
 
         if response.status_code == 200 and response.json().get("status") == "SUCCESS":
 
-            state_text="COMPLETED_C"
-            message_text="external API call succeeded"
-            log_level="info"
+            state_text = "COMPLETED_C"
+            message_text = "external API call succeeded"
+            log_level = "info"
 
         else:
 
-            state_text="FAILED_C"
-            message_text=f"external API call failed with status code {response.status_code}"
-            log_level="error"
-
-        r.set(f"workflow:{request_id}", state_text)
-            
-        log_event(
-            level=log_level,
-            trace_id=trace_id,
-            request_id=request_id,
-            state=state_text,
-            message=message_text
-        )
-
-        persist_event(
-            trace_id,
-            request_id,
-            state_text,
-            message_text
-        )
+            state_text = "FAILED_C"
+            message_text = "external API call failed"
+            log_level = "error"
 
     except Exception as e:
 
-        r.set(f"workflow:{request_id}", "ERRORED_C")
+        state_text = "ERRORED_C"
+        message_text = f"external API error: {str(e)}"
+        log_level = "error"
 
-        log_event(
-            level="error",
-            trace_id=trace_id,
-            request_id=request_id,
-            state="ERRORED_C",
-            message=f"external API call failed: {str(e)}"
-        )
+    # ----------------------------
+    # FINAL STATE UPDATE
+    # ----------------------------
+    r.set(f"workflow:{request_id}", state_text)
 
-        persist_event(
-            trace_id,
-            request_id,
-            "ERRORED_C",
-            f"external API call failed: {str(e)}"
-        )
+    log_event(
+        level=log_level,
+        trace_id=trace_id,
+        request_id=request_id,
+        state=state_text,
+        message=message_text
+    )
 
-        return
-    
-    # cleanup redis after completion
-    time.sleep(2)
+    persist_event(
+        trace_id,
+        request_id,
+        state_text,
+        message_text
+    )
 
+    # ----------------------------
+    # REDIS CLEANUP  (keep visibility longer now)
+    # ----------------------------
     r.expire(f"workflow:{request_id}", 3600)
 
     log_event(
@@ -215,17 +294,16 @@ def callback(ch, method, properties, body):
         trace_id=trace_id,
         request_id=request_id,
         state="CACHE_CLEANUP",
-        message="redis workflow cache deleted"
+        message="redis workflow cache set to expire"
     )
 
     persist_event(
         trace_id,
         request_id,
-        "COMPLETED",
-        "workflow completed successfully"
+        "CACHE_CLEANUP",
+        "workflow marked for cleanup"
     )
-    
-    return
+
 # ----------------------------
 # Start Consumer
 # ----------------------------

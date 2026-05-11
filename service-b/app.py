@@ -87,6 +87,20 @@ def persist_event(trace_id, request_id, state, message):
     conn.close()
 
 # ----------------------------
+# Retry + DLQ CONFIG (NEW)
+# ----------------------------
+MAX_RETRIES = 3
+RETRY_KEY_PREFIX = "retry:"
+
+def get_retry_count(request_id):
+    return int(r.get(f"{RETRY_KEY_PREFIX}{request_id}") or 0)
+
+def increment_retry(request_id):
+    count = get_retry_count(request_id) + 1
+    r.set(f"{RETRY_KEY_PREFIX}{request_id}", count)
+    return count
+
+# ----------------------------
 # RabbitMQ Connection Retry
 # ----------------------------
 connection = None
@@ -118,6 +132,18 @@ channel.queue_declare(queue="workflow_queue")
 # outgoing queue
 channel.queue_declare(queue="workflow_queue_c")
 
+# ----------------------------
+# DLQ (NEW)
+# ----------------------------
+channel.queue_declare(queue="workflow_dlq")
+
+def send_to_dlq(message):
+
+    channel.basic_publish(
+        exchange="",
+        routing_key="workflow_dlq",
+        body=json.dumps(message)
+    )
 
 # ----------------------------
 # Consumer Callback
@@ -129,6 +155,9 @@ def callback(ch, method, properties, body):
     trace_id = message["trace_id"]
     request_id = message["request_id"]
 
+    # ----------------------------
+    # Step B: Processing start
+    # ----------------------------
     log_event(
         level="info",
         trace_id=trace_id,
@@ -151,8 +180,15 @@ def callback(ch, method, properties, body):
     # simulate processing
     time.sleep(random.randint(1, 4))
 
-    # simulate random failure
-    if random.randint(1, 10) > 8:
+    # ----------------------------
+    # FAILURE SIMULATION (NEW STEP 2)
+    # ----------------------------
+    should_fail = random.randint(1, 10) > 8
+
+    if should_fail:
+
+        # increment retry counter
+        retry_count = increment_retry(request_id)
 
         r.set(f"workflow:{request_id}", "FAILED_B")
 
@@ -161,7 +197,7 @@ def callback(ch, method, properties, body):
             trace_id=trace_id,
             request_id=request_id,
             state="FAILED_B",
-            message="processing failed in service-b"
+            message=f"service-b failed (retry {retry_count}/{MAX_RETRIES})"
         )
 
         # persist event to Postgres
@@ -169,12 +205,48 @@ def callback(ch, method, properties, body):
             trace_id,
             request_id,
             "FAILED_B",
-            "workflow failed in service b"
+            f"workflow failed in service b (retry {retry_count}/{MAX_RETRIES})"
         )
+
+        # ----------------------------
+        # RETRY LOGIC (NEW)
+        # ----------------------------
+        if retry_count <= MAX_RETRIES:
+
+            log_event(
+                level="warning",
+                trace_id=trace_id,
+                request_id=request_id,
+                state="RETRY_B",
+                message=f"retrying workflow (attempt {retry_count})"
+            )
+
+            # requeue message
+            channel.basic_publish(
+                exchange="",
+                routing_key="workflow_queue",
+                body=json.dumps(message)
+            )
+
+        else:
+
+            # send to DLQ after max retries
+            send_to_dlq(message)
+
+            log_event(
+                level="error",
+                trace_id=trace_id,
+                request_id=request_id,
+                state="DLQ_B",
+                message="max retries exceeded, sent to DLQ"
+            )
 
         return
 
-    # completed processing in B
+    # ----------------------------
+    # SUCCESS PATH
+    # ----------------------------
+
     r.set(f"workflow:{request_id}", "COMPLETED_B")
 
     log_event(

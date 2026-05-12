@@ -53,7 +53,7 @@ jobs:
 
           for i in {1..30}; do
 
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health || true)
 
             echo "HTTP Status: $STATUS"
 

@@ -77,8 +77,9 @@ jobs:
 
           exit 1
       
+
       # ----------------------------
-      # 6. Wait for full system readiness
+      # 6. Wait for full system readiness (with full diagnostics)
       # ----------------------------
       - name: Wait for system readiness
         run: |
@@ -87,11 +88,23 @@ jobs:
 
           for i in {1..30}; do
 
+            echo "------------------------------"
+            echo "Attempt: $i"
+            echo "------------------------------"
+
             RESPONSE=$(curl -s http://localhost:8080/system/status || true)
 
-            READY=$(echo "$RESPONSE" | jq -r '.["service-b"].ready == true and .["service-c"].ready == true')
+            echo "Full system response:"
+            echo "$RESPONSE" | jq . || echo "Invalid JSON response"
 
-            echo "System ready: $READY"
+            echo ""
+            echo "Service-level readiness breakdown:"
+            echo "$RESPONSE" | jq 'map_values({ready, dependencies})' || true
+
+            READY=$(echo "$RESPONSE" | jq -r '.["service-a"].ready == true and .["service-b"].ready == true and .["service-c"].ready == true')
+
+            echo ""
+            echo "Aggregated readiness: $READY"
 
             if [ "$READY" = "true" ]; then
 
@@ -101,13 +114,22 @@ jobs:
 
             fi
 
+            echo ""
             echo "System not ready yet..."
+            echo "Retrying in 5 seconds..."
 
             sleep 5
 
           done
 
-          echo "System readiness failed"
+          echo "=============================="
+          echo "SYSTEM READINESS FAILED"
+          echo "Dumping final diagnostics..."
+          echo "=============================="
+
+          RESPONSE=$(curl -s http://localhost:8080/system/status || true)
+
+          echo "$RESPONSE" | jq . || echo "$RESPONSE"
 
           docker compose logs
 

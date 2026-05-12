@@ -1,12 +1,21 @@
 from fastapi import FastAPI
 import time
 import random
-import uuid
 import logging
 from datetime import datetime
 
 app = FastAPI()
 
+#----------------------------
+# Health Check Endpoint
+#----------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+#----------------------------
+# Simulated External API Endpoint
+#----------------------------
 @app.get("/process")
 def process(request_id: str):
 

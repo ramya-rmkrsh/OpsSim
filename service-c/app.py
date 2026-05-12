@@ -138,28 +138,30 @@ def persist_event(trace_id, request_id, state, message):
 # ----------------------------
 # RabbitMQ Connection Retry
 # ----------------------------
-connection = None
+def connect_rabbitmq():
+    
+    while True:
 
-while connection is None:
+        try:
 
-    try:
+            logger.info("Attempting RabbitMQ connection...")
 
-        logger.info("Attempting RabbitMQ connection...")
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host="rabbitmq")
+            )
 
-        connection = pika.BlockingConnection(
-            pika.ConnectionParameters(host="rabbitmq")
-        )
+            # update service status on first successful RabbitMQ connection
+            SERVICE_STATUS["dependencies"]["rabbitmq"] = True
 
-        # update service status on first successful RabbitMQ connection
-        SERVICE_STATUS["dependencies"]["rabbitmq"] = True
+            logger.info("Connected to RabbitMQ")
 
-        logger.info("Connected to RabbitMQ")
+        except pika.exceptions.AMQPConnectionError:
 
-    except pika.exceptions.AMQPConnectionError:
+            logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
 
-        logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
+            time.sleep(5)
 
-        time.sleep(5)
+connection = connect_rabbitmq()
 
 channel = connection.channel()
 

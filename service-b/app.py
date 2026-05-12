@@ -137,28 +137,29 @@ def increment_retry(request_id):
 # ----------------------------
 # RabbitMQ Connection Retry
 # ----------------------------
-connection = None
+def connect_rabbitmq():
 
-while connection is None:
+    while True:
 
-    try:
+        try:
 
-        logger.info("Attempting RabbitMQ connection...")
+            logger.info("Attempting RabbitMQ connection...")
 
-        connection = pika.BlockingConnection(
-            pika.ConnectionParameters(host="rabbitmq")
-        )
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host="rabbitmq")
+            )
 
-        logger.info("Connected to RabbitMQ")
+            logger.info("Connected to RabbitMQ")
 
-        SERVICE_STATUS["dependencies"]["rabbitmq"] = True
+            SERVICE_STATUS["dependencies"]["rabbitmq"] = True
 
-    except pika.exceptions.AMQPConnectionError:
+        except pika.exceptions.AMQPConnectionError:
 
-        logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
+            logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
 
-        time.sleep(5)
+            time.sleep(5)
 
+connection = connect_rabbitmq()
 
 channel = connection.channel()
 

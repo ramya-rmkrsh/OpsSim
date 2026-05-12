@@ -113,6 +113,14 @@ def publish_message(message):
 
     connection.close()
 
+# ----------------------------
+# Health Check Endpoint
+# ----------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
 
 # ----------------------------
 # Status endpoint (Redis)

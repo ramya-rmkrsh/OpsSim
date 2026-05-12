@@ -53,7 +53,7 @@ jobs:
 
           for i in {1..30}; do
 
-            if curl -s http://localhost:8000/docs > /dev/null; then
+            if curl -s http://localhost:8080/docs > /dev/null; then
 
               echo "service-a is ready"
 
@@ -81,7 +81,7 @@ jobs:
         id: trigger
         run: |
 
-          RESPONSE=$(curl -s http://localhost:8000/work)
+          RESPONSE=$(curl -s http://localhost:8080/work)
 
           echo "Response: $RESPONSE"
 
@@ -108,7 +108,7 @@ jobs:
 
           REQUEST_ID="${{ steps.trigger.outputs.request_id }}"
 
-          STATUS=$(curl -s http://localhost:8000/status/$REQUEST_ID | jq -r '.status')
+          STATUS=$(curl -s http://localhost:8080/status/$REQUEST_ID | jq -r '.status')
 
           echo "Final workflow status: $STATUS"
 

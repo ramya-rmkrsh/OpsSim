@@ -8,6 +8,19 @@ from datetime import datetime
 import psycopg2
 import requests
 
+#----------------------------
+# Service Status 
+#----------------------------
+SERVICE_STATUS = {
+    "ready": False,
+    "dependencies": {
+        "redis": False,
+        "postgres": False,
+        "rabbitmq": False,
+        "external_api": False
+    }
+}
+
 # ----------------------------
 # Logging
 # ----------------------------
@@ -31,6 +44,17 @@ def get_db_connection():
         password="opspassword"
     )
 
+#----------------------------
+# Postgres Health Check
+#----------------------------
+def check_postgres():
+    try:
+        conn = get_db_connection()
+        conn.close()
+        return True
+    except:
+        return False
+    
 # ----------------------------
 # Redis
 # ----------------------------
@@ -40,6 +64,16 @@ r = redis.Redis(
     decode_responses=True
 )
 
+#----------------------------
+# Redis Health Check
+#----------------------------
+def check_redis():
+    try:
+        r.ping()
+        return True
+    except Exception:
+        return False
+    
 # ----------------------------
 # Retry Config (NEW)
 # ----------------------------
@@ -116,6 +150,9 @@ while connection is None:
             pika.ConnectionParameters(host="rabbitmq")
         )
 
+        # update service status on first successful RabbitMQ connection
+        SERVICE_STATUS["dependencies"]["rabbitmq"] = True
+
         logger.info("Connected to RabbitMQ")
 
     except pika.exceptions.AMQPConnectionError:
@@ -140,6 +177,45 @@ def send_to_dlq(message):
         routing_key="workflow_dlq",
         body=json.dumps(message)
     )
+
+#----------------------------
+# External API Health Check
+#----------------------------
+def check_external_api():
+    try:
+        response = requests.get(
+            "http://external-api:8003/health",
+            timeout=2
+        )
+
+        return response.status_code == 200
+
+    except Exception:
+        return False
+
+#----------------------------
+# Readiness Check 
+#----------------------------
+def ready():
+
+    SERVICE_STATUS["dependencies"]["redis"] = check_redis()
+    SERVICE_STATUS["dependencies"]["postgres"] = check_postgres()
+    SERVICE_STATUS["dependencies"]["external_api"] = check_external_api()
+
+    deps = SERVICE_STATUS["dependencies"]
+
+    if all(deps.values()):
+        SERVICE_STATUS["ready"] = True
+    else:
+        SERVICE_STATUS["ready"] = False
+
+    r.set(
+        "service-c:ready",
+        json.dumps(SERVICE_STATUS),
+        ex=60
+    )
+    
+    return SERVICE_STATUS
 
 # ----------------------------
 # Consumer Callback

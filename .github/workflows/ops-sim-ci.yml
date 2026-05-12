@@ -53,9 +53,13 @@ jobs:
 
           for i in {1..30}; do
 
-            if curl -s http://localhost:8080/docs > /dev/null; then
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
 
-              echo "service-a is ready"
+            echo "HTTP Status: $STATUS"
+
+            if [ "$STATUS" = "200" ]; then
+
+              echo "service-a is healthy"
 
               exit 0
 

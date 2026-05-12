@@ -42,7 +42,6 @@ def get_db_connection():
         password="opspassword"
     )
 
-
 # ----------------------------
 # Structured Logging Helper
 # ----------------------------
@@ -58,7 +57,6 @@ def log_event(level, trace_id, request_id, state, message):
     }
 
     print(json.dumps(log_data), flush=True)
-
 
 # ----------------------------
 # Persist Workflow Event
@@ -91,7 +89,6 @@ def persist_event(trace_id, request_id, state, message):
     cur.close()
     conn.close()
 
-
 # ----------------------------
 # RabbitMQ Publisher
 # ----------------------------
@@ -116,12 +113,68 @@ def publish_message(message):
 # ----------------------------
 # Health Check Endpoint
 # ----------------------------
-
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
+# ----------------------------
+# Readiness Check Endpoint
+# ----------------------------
+@app.get("/ready")
+def ready():
 
+    dependencies = {
+        "redis": False,
+        "rabbitmq": False,
+        "postgres": False
+    }
+
+    # Redis check
+    try:
+        r.ping()
+        dependencies["redis"] = True
+    except:
+        pass
+
+    # RabbitMQ check
+    try:
+        connection = pika.BlockingConnection(
+            pika.ConnectionParameters(host="rabbitmq")
+        )
+        connection.close()
+
+        dependencies["rabbitmq"] = True
+
+    except:
+        pass
+
+    # Postgres check
+    try:
+        conn = get_db_connection()
+        conn.close()
+        dependencies["postgres"] = True
+
+    except:
+        return False
+      
+    ready = all(dependencies.values())
+
+    return {
+        "ready": ready,
+        "dependencies": dependencies
+    }
+
+#----------------------------
+# System Status Endpoint
+#----------------------------
+@app.get("/system/status")
+def system_status():
+    return {
+        "service-a": ready(),
+        "service-b": json.loads(r.get("service-b:ready") or "{}"),
+        "service-c": json.loads(r.get("service-c:ready") or "{}")
+    }
+    
 # ----------------------------
 # Status endpoint (Redis)
 # ----------------------------
@@ -137,7 +190,6 @@ def get_status(request_id: str):
         "request_id": request_id,
         "live_status": state
     }
-
 
 # ----------------------------
 # Workflow history endpoint (Postgres)
@@ -185,7 +237,6 @@ def workflow_history(request_id: str):
         "workflow_history": events
     }
 
-
 # ----------------------------
 # Final Result Endpoint
 # ----------------------------
@@ -195,7 +246,6 @@ FINAL_STATES = [
     "ERRORED_C",
     "COMPLETED_C"
 ]
-
 
 @app.get("/result/{request_id}")
 def get_result(request_id: str):
@@ -210,7 +260,6 @@ def get_result(request_id: str):
         "current_state": state,
         "workflow_completed": state in FINAL_STATES
     }
-
 
 # ----------------------------
 # Workflow entry point

@@ -76,10 +76,45 @@ jobs:
           docker compose logs
 
           exit 1
-
-
+      
       # ----------------------------
-      # 6. Trigger workflow
+      # 6. Wait for full system readiness
+      # ----------------------------
+      - name: Wait for system readiness
+        run: |
+
+          echo "Waiting for system readiness..."
+
+          for i in {1..30}; do
+
+            RESPONSE=$(curl -s http://localhost:8080/system/status || true)
+
+            READY=$(echo "$RESPONSE" | jq -r '.["service-b"].ready == true and .["service-c"].ready == true')
+
+            echo "System ready: $READY"
+
+            if [ "$READY" = "true" ]; then
+
+              echo "All services are ready"
+
+              exit 0
+
+            fi
+
+            echo "System not ready yet..."
+
+            sleep 5
+
+          done
+
+          echo "System readiness failed"
+
+          docker compose logs
+
+          exit 1
+      
+      # ----------------------------
+      # 7. Trigger workflow
       # ----------------------------
       - name: Trigger workflow
         id: trigger
@@ -95,17 +130,45 @@ jobs:
           echo "trace_id=$TRACE_ID" >> $GITHUB_OUTPUT
           echo "request_id=$REQUEST_ID" >> $GITHUB_OUTPUT
 
-
       # ----------------------------
-      # 7. Wait for workflow completion
+      # 8. Wait for workflow completion
       # ----------------------------
       - name: Wait for workflow completion
         run: |
-          sleep 25
 
+          REQUEST_ID="${{ steps.trigger.outputs.request_id }}"
 
+          echo "Waiting for workflow completion..."
+
+          for i in {1..30}; do
+
+            STATUS=$(curl -s http://localhost:8080/status/$REQUEST_ID | jq -r '.status')
+
+            echo "Current workflow status: $STATUS"
+
+            if [[ "$STATUS" == "COMPLETED_C" || \
+                  "$STATUS" == "FAILED_B" || \
+                  "$STATUS" == "FAILED_C" || \
+                  "$STATUS" == "ERRORED_C" ]]; then
+
+              echo "Workflow reached terminal state"
+
+              exit 0
+
+            fi
+
+            sleep 5
+
+          done
+
+          echo "Workflow timed out"
+
+          docker compose logs
+
+          exit 1
+          
       # ----------------------------
-      # 8. Validate workflow status
+      # 9. Validate workflow status
       # ----------------------------
       - name: Validate final workflow status
         run: |
@@ -133,7 +196,7 @@ jobs:
 
 
       # ----------------------------
-      # 9. Print logs if failure
+      # 10. Print logs if failure
       # ----------------------------
       - name: Print container logs on failure
         if: failure()
@@ -142,7 +205,7 @@ jobs:
 
 
       # ----------------------------
-      # 10. Shutdown containers
+      # 11. Shutdown containers
       # ----------------------------
       - name: Shutdown services
         if: always()

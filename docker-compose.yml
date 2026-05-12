@@ -6,23 +6,32 @@ services:
     ports:
       - "8001:8000"
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
 
   service-b:
     build: ./service-b
     ports:
       - "8002:8000"
     depends_on:
-      - redis
-      - service-c
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      service-c:
 
   service-c:
     build: ./service-c
     ports:
       - "8003:8000"
     depends_on:
-      - redis
-
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+        
   external-api:
     build: ./external-api
     ports:

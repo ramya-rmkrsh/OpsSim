@@ -7,6 +7,19 @@ import random
 from datetime import datetime
 import psycopg2
 
+#----------------------------
+# Service Status 
+#----------------------------
+SERVICE_STATUS = {
+    "service": "service-b",
+    "ready": False,
+    "dependencies": {
+        "rabbitmq": False,
+        "redis": False,
+        "postgres": False
+    }
+}
+
 # ----------------------------
 # Logging
 # ----------------------------
@@ -27,6 +40,16 @@ r = redis.Redis(
     decode_responses=True
 )
 
+#----------------------------
+# Redis Readiness Check
+#----------------------------
+def check_redis():
+    try:
+        r.ping()
+        return True
+    except Exception:
+        return False
+    
 # ----------------------------
 # Postgres Connection
 # ----------------------------
@@ -39,6 +62,17 @@ def get_db_connection():
         password="opspassword"
     )
 
+#----------------------------
+# Postgres Readiness Check
+#----------------------------
+def check_postgres():
+    try:
+        conn = get_db_connection()
+        conn.close()
+        return True
+    except:
+        return False
+    
 # ----------------------------
 # Structured Logging
 # ----------------------------
@@ -117,6 +151,8 @@ while connection is None:
 
         logger.info("Connected to RabbitMQ")
 
+        SERVICE_STATUS["dependencies"]["rabbitmq"] = True
+
     except pika.exceptions.AMQPConnectionError:
 
         logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
@@ -144,6 +180,29 @@ def send_to_dlq(message):
         routing_key="workflow_dlq",
         body=json.dumps(message)
     )
+
+#----------------------------
+# Readiness Check 
+#----------------------------
+def ready():
+
+    SERVICE_STATUS["dependencies"]["redis"] = check_redis()
+    SERVICE_STATUS["dependencies"]["postgres"] = check_postgres()
+        
+    deps = SERVICE_STATUS["dependencies"]
+
+    if all(deps.values()):
+        SERVICE_STATUS["ready"] = True
+    else:
+        SERVICE_STATUS["ready"] = False
+
+    r.set(
+    "service-b:ready",
+        json.dumps(SERVICE_STATUS),
+        ex=60
+    )
+    
+    return SERVICE_STATUS
 
 # ----------------------------
 # Consumer Callback

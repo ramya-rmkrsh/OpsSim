@@ -79,8 +79,40 @@ jobs:
           echo "RabbitMQ failed to start"
           docker compose logs rabbitmq
           exit 1
+
       # ----------------------------
-      # 7. Wait for full system readiness (REAL GATE)
+      # 7. Wait for service-b and service-c to register in Redis (REAL GATE for service readiness)
+      # ----------------------------
+      - name: Wait for service-b and service-c to register in Redis
+        run: |
+          echo "Polling Redis for service-b and service-c readiness..."
+          for i in {1..30}; do
+            B_RAW=$(docker compose exec -T redis redis-cli GET "service-b:ready" 2>/dev/null)
+            C_RAW=$(docker compose exec -T redis redis-cli GET "service-c:ready" 2>/dev/null)
+
+            # Handle empty string (key doesn't exist yet) explicitly
+            B_READY=$(echo "${B_RAW:-{\}}" | jq -r '.ready // false' 2>/dev/null || echo "false")
+            C_READY=$(echo "${C_RAW:-{\}}" | jq -r '.ready // false' 2>/dev/null || echo "false")
+
+            echo "Attempt $i | service-b=$B_READY | service-c=$C_READY"
+            [ -n "$B_RAW" ] && echo "  B: $B_RAW"
+            [ -n "$C_RAW" ] && echo "  C: $C_RAW"
+
+            if [ "$B_READY" = "true" ] && [ "$C_READY" = "true" ]; then
+              echo "Both services ready"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "=== Timed out. Debug info ==="
+          docker compose exec -T redis redis-cli KEYS "*"
+          docker compose logs service-b --tail=40
+          docker compose logs service-c --tail=40
+          exit 1  
+
+      # ----------------------------
+      # 8. Wait for full system readiness (REAL GATE)
       # ----------------------------
       - name: Wait for system readiness
         run: |
@@ -114,7 +146,7 @@ jobs:
           exit 1
 
       # ----------------------------
-      # 8. Trigger workflow (ONLY after full readiness)
+      # 9. Trigger workflow (ONLY after full readiness)
       # ----------------------------
       - name: Trigger workflow
         id: trigger
@@ -140,7 +172,7 @@ jobs:
           echo "request_id=$REQUEST_ID" >> $GITHUB_OUTPUT
 
       # ----------------------------
-      # 9. Wait for workflow completion
+      # 10. Wait for workflow completion
       # ----------------------------
       - name: Wait for workflow completion
         run: |
@@ -172,7 +204,7 @@ jobs:
           exit 1
 
       # ----------------------------
-      # 10. Final validation
+      # 11. Final validation
       # ----------------------------
       - name: Validate final workflow status
         run: |
@@ -196,7 +228,7 @@ jobs:
           echo "Workflow successful"
 
       # ----------------------------
-      # 11. Logs on failure
+      # 12. Logs on failure
       # ----------------------------
       - name: Print logs
         if: failure()
@@ -204,7 +236,7 @@ jobs:
           docker compose logs
 
       # ----------------------------
-      # 12. Cleanup
+      # 13. Cleanup
       # ----------------------------
       - name: Shutdown
         if: always()

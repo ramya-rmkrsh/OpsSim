@@ -63,7 +63,24 @@ jobs:
           exit 1
 
       # ----------------------------
-      # 6. Wait for full system readiness (REAL GATE)
+      # 6. RabbitMQ Readiness Check (REAL GATE for RMQ)
+      # ----------------------------
+      - name: Wait for RabbitMQ to be ready
+        run: |
+          echo "Waiting for RabbitMQ..."
+          for i in {1..30}; do
+            if docker compose exec -T rabbitmq rabbitmq-diagnostics check_port_connectivity > /dev/null 2>&1; then
+              echo "RabbitMQ is ready after attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i - RabbitMQ not ready yet"
+            sleep 5
+          done
+          echo "RabbitMQ failed to start"
+          docker compose logs rabbitmq
+          exit 1
+      # ----------------------------
+      # 7. Wait for full system readiness (REAL GATE)
       # ----------------------------
       - name: Wait for system readiness
         run: |
@@ -97,7 +114,7 @@ jobs:
           exit 1
 
       # ----------------------------
-      # 7. Trigger workflow (ONLY after full readiness)
+      # 8. Trigger workflow (ONLY after full readiness)
       # ----------------------------
       - name: Trigger workflow
         id: trigger
@@ -123,7 +140,7 @@ jobs:
           echo "request_id=$REQUEST_ID" >> $GITHUB_OUTPUT
 
       # ----------------------------
-      # 8. Wait for workflow completion
+      # 9. Wait for workflow completion
       # ----------------------------
       - name: Wait for workflow completion
         run: |
@@ -155,7 +172,7 @@ jobs:
           exit 1
 
       # ----------------------------
-      # 9. Final validation
+      # 10. Final validation
       # ----------------------------
       - name: Validate final workflow status
         run: |
@@ -179,7 +196,7 @@ jobs:
           echo "Workflow successful"
 
       # ----------------------------
-      # 10. Logs on failure
+      # 11. Logs on failure
       # ----------------------------
       - name: Print logs
         if: failure()
@@ -187,7 +204,7 @@ jobs:
           docker compose logs
 
       # ----------------------------
-      # 11. Cleanup
+      # 12. Cleanup
       # ----------------------------
       - name: Shutdown
         if: always()

@@ -5,33 +5,39 @@ services:
     build: ./service-a
     ports:
       - "8001:8000"
-    depends_on:
-      redis:
-        condition: service_started
-      rabbitmq:
-        condition: service_healthy
-
-  service-b:
-    build: ./service-b
-    ports:
-      - "8002:8000"
-    depends_on:
-      redis:
-        condition: service_started
-      rabbitmq:
-        condition: service_healthy
-  
-  service-c:
-    build: ./service-c
-    ports:
-      - "8003:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     depends_on:
       redis:
         condition: service_started
       rabbitmq:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+
+  service-b:
+    build: ./service-b
+    depends_on:
+      redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+  
+  service-c:
+    build: ./service-c
+    depends_on:
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
       service-b:
         condition: service_started
 
@@ -52,9 +58,9 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf
     depends_on:
-      - service-a
-      - service-b
-
+      service-a:
+        condition: service_healthy
+  
   rabbitmq:
     image: rabbitmq:3-management
     ports:
@@ -82,6 +88,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
-      
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opsuser -d opssim"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s 
+
 volumes:
   postgres_data:

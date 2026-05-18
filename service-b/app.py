@@ -261,7 +261,7 @@ def callback(ch, method, properties, body):
             # requeue message
             ch.basic_publish(
                 exchange="",
-                routing_key="workflow_queue",
+                routing_key="workflow_queue_b",
                 body=json.dumps(message)
             )
 
@@ -366,7 +366,7 @@ connection = connect_rabbitmq()
 
 channel = connection.channel()
 
-channel.queue_declare(queue="workflow_queue")
+channel.queue_declare(queue="workflow_queue_b")
 
 channel.queue_declare(queue="workflow_queue_c")
 
@@ -375,7 +375,7 @@ channel.queue_declare(queue="workflow_dlq")
 ready()   # write initial ready state after full setup
 
 channel.basic_consume(
-    queue="workflow_queue",
+    queue="workflow_queue_b",
     on_message_callback=callback,
     auto_ack=True
 )

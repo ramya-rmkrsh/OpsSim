@@ -7,6 +7,21 @@ import random
 from datetime import datetime
 import psycopg2
 import requests
+import threading
+
+#----------------------------
+# Service Status 
+#----------------------------
+SERVICE_STATUS = {
+    "service": "service-c",
+    "ready": False,
+    "dependencies": {
+        "redis": False,
+        "postgres": False,
+        "rabbitmq": False,
+        "external_api": False
+    }
+}
 
 # ----------------------------
 # Logging
@@ -31,6 +46,17 @@ def get_db_connection():
         password="opspassword"
     )
 
+#----------------------------
+# Postgres Health Check
+#----------------------------
+def check_postgres():
+    try:
+        conn = get_db_connection()
+        conn.close()
+        return True
+    except:
+        return False
+    
 # ----------------------------
 # Redis
 # ----------------------------
@@ -39,6 +65,68 @@ r = redis.Redis(
     port=6379,
     decode_responses=True
 )
+
+#----------------------------
+# Redis Health Check
+#----------------------------
+def check_redis():
+    try:
+        r.ping()
+        return True
+    except Exception:
+        return False
+
+# ----------------------------
+# External API Health Check
+# ----------------------------
+def check_external_api():
+    try:
+        response = requests.get(
+            "http://external-api:8003/health", 
+            timeout=2
+        )
+        return response.status_code == 200
+    
+    except Exception:
+
+        return False
+
+# ----------------------------
+# RabbitMQ connection holder and readiness check
+# ----------------------------
+rmq_connection = None
+ 
+def check_rabbitmq():
+    try:
+        return rmq_connection is not None and rmq_connection.is_open
+    except Exception:
+        return False
+ 
+# ----------------------------
+# Readiness Check
+# ----------------------------
+def ready():
+    SERVICE_STATUS["dependencies"]["redis"] = check_redis()
+    SERVICE_STATUS["dependencies"]["postgres"] = check_postgres()
+    SERVICE_STATUS["dependencies"]["rabbitmq"] = check_rabbitmq()
+    SERVICE_STATUS["dependencies"]["external_api"] = check_external_api()
+ 
+    SERVICE_STATUS["ready"] = all(SERVICE_STATUS["dependencies"].values())
+ 
+    r.set("service-c:ready", json.dumps(SERVICE_STATUS), ex=60)
+    return SERVICE_STATUS
+ 
+# ----------------------------
+# Heartbeat to check dependencies and update status in Redis
+# ----------------------------
+def heartbeat_loop():
+    
+    while True:
+        try:
+            ready()
+        except Exception as e:
+            logger.error(f"Heartbeat error: {e}")
+        time.sleep(10)
 
 # ----------------------------
 # Retry Config (NEW)
@@ -102,40 +190,11 @@ def persist_event(trace_id, request_id, state, message):
     conn.close()
 
 # ----------------------------
-# RabbitMQ Connection Retry
+# DLQ 
 # ----------------------------
-connection = None
+def send_to_dlq(ch, message):
 
-while connection is None:
-
-    try:
-
-        logger.info("Attempting RabbitMQ connection...")
-
-        connection = pika.BlockingConnection(
-            pika.ConnectionParameters(host="rabbitmq")
-        )
-
-        logger.info("Connected to RabbitMQ")
-
-    except pika.exceptions.AMQPConnectionError:
-
-        logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
-
-        time.sleep(5)
-
-channel = connection.channel()
-
-channel.queue_declare(queue="workflow_queue_c")
-
-# ----------------------------
-# DLQ (NEW)
-# ----------------------------
-channel.queue_declare(queue="workflow_dlq")
-
-def send_to_dlq(message):
-
-    channel.basic_publish(
+    ch.basic_publish(
         exchange="",
         routing_key="workflow_dlq",
         body=json.dumps(message)
@@ -199,7 +258,7 @@ def callback(ch, method, properties, body):
             trace_id,
             request_id,
             "FAILED_C",
-            f"workflow failed in service b (retry {retry_count}/{MAX_RETRIES})"
+            f"workflow failed in service c (retry {retry_count}/{MAX_RETRIES})"
         )
 
         # ----------------------------
@@ -215,7 +274,7 @@ def callback(ch, method, properties, body):
                 message=f"retrying service-c ({retry_count}/{MAX_RETRIES})"
             )
 
-            channel.basic_publish(
+            ch.basic_publish(
                 exchange="",
                 routing_key="workflow_queue_c",
                 body=json.dumps(message)
@@ -223,7 +282,7 @@ def callback(ch, method, properties, body):
 
         else:
 
-            send_to_dlq(message)
+            send_to_dlq(ch, message)
 
             log_event(
                 level="error",
@@ -305,13 +364,42 @@ def callback(ch, method, properties, body):
     )
 
 # ----------------------------
+# RabbitMQ Connection
+# ----------------------------
+def connect_rabbitmq():
+    global rmq_connection
+    while True:
+        try:
+            logger.info("Attempting RabbitMQ connection...")
+            rmq_connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host="rabbitmq")
+            )
+            logger.info("Connected to RabbitMQ")
+            SERVICE_STATUS["dependencies"]["rabbitmq"] = True
+            return rmq_connection
+        except pika.exceptions.AMQPConnectionError:
+            logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
+            SERVICE_STATUS["dependencies"]["rabbitmq"] = False
+            time.sleep(5)
+ 
+# ----------------------------
 # Start Consumer
 # ----------------------------
+connection = connect_rabbitmq()
+channel = connection.channel()
+ 
+channel.queue_declare(queue="workflow_queue_c")
+channel.queue_declare(queue="workflow_dlq")
+ 
+ready()   # write initial ready state after full setup
+
 channel.basic_consume(
     queue="workflow_queue_c",
     on_message_callback=callback,
     auto_ack=True
 )
+ 
+threading.Thread(target=heartbeat_loop, daemon=True).start()
 
 logger.info("service-c waiting for RabbitMQ messages...")
 

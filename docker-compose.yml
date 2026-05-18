@@ -1,27 +1,55 @@
 
 services:
 
+  nginx:
+    image: nginx:latest
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      service-a:
+        condition: service_healthy
+
   service-a:
     build: ./service-a
     ports:
       - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"] # Instead of curl, using Python to avoid adding extra dependencies
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 
   service-b:
     build: ./service-b
-    ports:
-      - "8002:8000"
     depends_on:
-      - redis
-      - service-c
-
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+  
   service-c:
     build: ./service-c
-    ports:
-      - "8003:8000"
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      service-b:
+        condition: service_started
 
   external-api:
     build: ./external-api
@@ -33,36 +61,35 @@ services:
     ports:
       - "6379:6379"
 
-  nginx:
-    image: nginx:latest
-    ports:
-      - "8080:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
-    depends_on:
-      - service-a
-      - service-b
-
   rabbitmq:
     image: rabbitmq:3-management
     ports:
       - "5672:5672"
       - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
 
   postgres:
     image: postgres:15
-
     environment:
       POSTGRES_DB: opssim
       POSTGRES_USER: opsuser
       POSTGRES_PASSWORD: opspassword
-
     ports:
       - "5432:5432"
-
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
-      
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opsuser -d opssim"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s 
+
 volumes:
   postgres_data:

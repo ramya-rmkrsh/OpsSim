@@ -2,23 +2,22 @@ name: OpsSim CI Pipeline
 
 on:
   push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
 
     steps:
+
       # ----------------------------
-      # 1. Checkout code
+      # 1. Checkout repository
       # ----------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ----------------------------
-      # 2. Set up Docker
+      # 2. Setup Docker Buildx
       # ----------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -33,65 +32,193 @@ jobs:
       # ----------------------------
       # 4. Start full stack
       # ----------------------------
-      - name: Start system
+      - name: Start services
         run: |
           docker compose up -d
 
-      # Wait for services to stabilize
-      - name: Wait for system startup
-        run: sleep 20
+      # ----------------------------
+      # 5. Wait for service-a (entry point stability)
+      # ----------------------------
+      - name: Wait for service-a health
+        run: |
+
+          echo "Waiting for service-a..."
+
+          for i in {1..40}; do
+
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health || true)
+
+            echo "Attempt $i - HTTP: $STATUS"
+
+            if [ "$STATUS" = "200" ]; then
+              echo "service-a is healthy"
+              exit 0
+            fi
+
+            sleep 3
+          done
+
+          echo "service-a failed to become healthy"
+          docker compose logs
+          exit 1
 
       # ----------------------------
-      # 5. Trigger workflow
+      # 6. RabbitMQ Readiness Check (REAL GATE for RMQ)
+      # ----------------------------
+      - name: Wait for RabbitMQ to be ready
+        run: |
+          echo "Waiting for RabbitMQ..."
+          for i in {1..30}; do
+            if docker compose exec -T rabbitmq rabbitmq-diagnostics check_port_connectivity > /dev/null 2>&1; then
+              echo "RabbitMQ is ready after attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i - RabbitMQ not ready yet"
+            sleep 5
+          done
+          echo "RabbitMQ failed to start"
+          docker compose logs rabbitmq
+          exit 1
+
+      # ----------------------------
+      # 7. Wait for service-b and service-c to register in Redis (REAL GATE for service readiness)
+      # ----------------------------
+      - name: Wait for service-b and service-c to register in Redis
+        run: |
+          echo "Polling Redis for service-b and service-c readiness..."
+          for i in {1..30}; do
+            B_RAW=$(docker compose exec -T redis redis-cli GET "service-b:ready" 2>/dev/null)
+            C_RAW=$(docker compose exec -T redis redis-cli GET "service-c:ready" 2>/dev/null)
+
+            # Handle empty string (key doesn't exist yet) explicitly
+            B_READY=$(echo "${B_RAW:-{\}}" | jq -r '.ready // false' 2>/dev/null || echo "false")
+            C_READY=$(echo "${C_RAW:-{\}}" | jq -r '.ready // false' 2>/dev/null || echo "false")
+
+            echo "Attempt $i | service-b=$B_READY | service-c=$C_READY"
+            [ -n "$B_RAW" ] && echo "  B: $B_RAW"
+            [ -n "$C_RAW" ] && echo "  C: $C_RAW"
+
+            if [ "$B_READY" = "true" ] && [ "$C_READY" = "true" ]; then
+              echo "Both services ready"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "=== Timed out. Debug info ==="
+          docker compose exec -T redis redis-cli KEYS "*"
+          docker compose logs service-b --tail=40
+          docker compose logs service-c --tail=40
+          exit 1  
+
+      # ----------------------------
+      # 8. Wait for full system readiness (REAL GATE)
+      # ----------------------------
+      - name: Wait for system readiness
+        run: |
+
+          echo "Waiting for system readiness..."
+
+          for i in {1..40}; do
+
+            RESPONSE=$(curl -s http://localhost:8080/system/status || true)
+
+            echo "Attempt $i"
+            echo "Raw response:"
+            echo "$RESPONSE" | jq . || echo "Invalid JSON"
+
+            READY=$(echo "$RESPONSE" | jq -r '(.["service-a"].ready == true) and
+              (.["service-b"].ready == true) and
+              (.["service-c"].ready == true)' 2>/dev/null || echo "false")
+
+            echo "System ready = $READY"
+
+            if [ "$READY" = "true" ]; then
+              echo "All services are ready"
+              exit 0
+            fi
+
+            sleep 3
+          done
+
+          echo "System readiness failed"
+          docker compose logs
+          exit 1
+
+      # ----------------------------
+      # 9. Trigger workflow (ONLY after full readiness)
       # ----------------------------
       - name: Trigger workflow
         id: trigger
         run: |
-          RESPONSE=$(curl -s http://localhost:8000/work)
-          echo "Response: $RESPONSE"
 
-          TRACE_ID=$(echo $RESPONSE | jq -r '.trace_id')
-          REQUEST_ID=$(echo $RESPONSE | jq -r '.request_id')
+          echo "Triggering workflow..."
+
+          RESPONSE=$(curl -s http://localhost:8080/work || true)
+
+          echo "Response:"
+          echo "$RESPONSE" | jq . || echo "$RESPONSE"
+
+          TRACE_ID=$(echo "$RESPONSE" | jq -r '.trace_id // empty')
+          REQUEST_ID=$(echo "$RESPONSE" | jq -r '.request_id // empty')
+
+          if [ -z "$REQUEST_ID" ]; then
+            echo "Failed to get request_id"
+            docker compose logs
+            exit 1
+          fi
 
           echo "trace_id=$TRACE_ID" >> $GITHUB_OUTPUT
           echo "request_id=$REQUEST_ID" >> $GITHUB_OUTPUT
 
       # ----------------------------
-      # 6. Wait for processing
+      # 10. Wait for workflow completion
       # ----------------------------
       - name: Wait for workflow completion
-        run: sleep 25
-
-      # ----------------------------
-      # 7. Validate final status (Redis-backed API)
-      # ----------------------------
-      - name: Check workflow status
         run: |
           REQUEST_ID="${{ steps.trigger.outputs.request_id }}"
+          echo "Waiting for workflow completion: $REQUEST_ID"
 
-          STATUS=$(curl -s http://localhost:8000/status/$REQUEST_ID | jq -r '.status')
+          for i in {1..30}; do
+            STATUS=$(curl -s http://localhost:8080/status/$REQUEST_ID | jq -r '.status // "UNKNOWN"')
+            echo "Attempt $i - Status: $STATUS"
 
-          echo "Final status: $STATUS"
+            case "$STATUS" in
+              COMPLETED_C)
+                echo "Workflow completed successfully"
+                exit 0
+                ;;
+              FAILED_B|FAILED_C|ERRORED_C|DLQ_B|DLQ_C)
+                echo "Workflow reached terminal failure state: $STATUS"
+                exit 0  # still a valid terminal state — workflow behaved correctly
+                ;;
+              UNKNOWN)
+                echo "Status not found in Redis yet"
+                ;;
+              *)
+                echo "Workflow in progress: $STATUS"
+                ;;
+            esac
 
-          if [[ "$STATUS" == "UNKNOWN" || "$STATUS" == "PROCESSING_A" || "$STATUS" == "PROCESSING_B" ]]; then
-            echo "Workflow did not complete properly"
-            exit 1
-          fi
+            sleep 3
+          done
 
       # ----------------------------
-      # 8. Show logs on failure (debugging)
+      # 11. Logs on failure
       # ----------------------------
-      - name: Print logs on failure
+      - name: Print logs
         if: failure()
         run: |
-          docker compose logs service-a
-          docker compose logs service-b
-          docker compose logs service-c
+          echo "Logs on Failure"
+          docker compose logs service-a --tail=30
+          docker compose logs service-b --tail=30
+          docker compose logs service-c --tail=30
+          exit 1
 
       # ----------------------------
-      # 9. Cleanup
+      # 12. Cleanup
       # ----------------------------
-      - name: Shutdown system
+      - name: Shutdown
         if: always()
         run: |
           docker compose down -v

@@ -258,7 +258,7 @@ def callback(ch, method, properties, body):
             trace_id,
             request_id,
             "FAILED_C",
-            f"workflow failed in service b (retry {retry_count}/{MAX_RETRIES})"
+            f"workflow failed in service c (retry {retry_count}/{MAX_RETRIES})"
         )
 
         # ----------------------------

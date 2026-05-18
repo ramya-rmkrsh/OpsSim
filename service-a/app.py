@@ -6,6 +6,7 @@ import pika
 import json
 import psycopg2
 import time
+from datetime import datetime
 
 # ----------------------------
 # Logging Configuration

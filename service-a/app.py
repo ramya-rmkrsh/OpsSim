@@ -5,8 +5,7 @@ import uuid
 import pika
 import json
 import psycopg2
-
-from datetime import datetime
+import time
 
 # ----------------------------
 # Logging Configuration
@@ -41,6 +40,30 @@ def get_db_connection():
         user="opsuser",
         password="opspassword"
     )
+
+# ----------------------------
+# RabbitMQ Connection
+# ----------------------------
+def connect_rabbitmq():
+
+    global rmq_connection
+    while True:
+        try:
+            logger.info("Attempting RabbitMQ connection...")
+
+            rmq_connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host="rabbitmq")
+            )
+            logger.info("Connected to RabbitMQ")
+
+            return rmq_connection
+        
+        except pika.exceptions.AMQPConnectionError:
+
+            logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
+            
+            time.sleep(5)
+
 
 # ----------------------------
 # Structured Logging Helper
@@ -90,27 +113,6 @@ def persist_event(trace_id, request_id, state, message):
     conn.close()
 
 # ----------------------------
-# RabbitMQ Publisher
-# ----------------------------
-def publish_message(message):
-
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host="rabbitmq")
-    )
-
-    channel = connection.channel()
-
-    channel.queue_declare(queue="workflow_queue")
-
-    channel.basic_publish(
-        exchange="",
-        routing_key="workflow_queue",
-        body=json.dumps(message)
-    )
-
-    connection.close()
-
-# ----------------------------
 # Health Check Endpoint
 # ----------------------------
 @app.get("/health")
@@ -138,13 +140,12 @@ def ready():
 
     # RabbitMQ check
     try:
-        connection = pika.BlockingConnection(
-            pika.ConnectionParameters(host="rabbitmq")
-        )
-        connection.close()
-
+        #connection = pika.BlockingConnection(
+        #    pika.ConnectionParameters(host="rabbitmq")
+        #)
+        connection=connect_rabbitmq()
         dependencies["rabbitmq"] = True
-
+        connection.close()
     except:
         pass
 
@@ -188,7 +189,7 @@ def get_status(request_id: str):
 
     return {
         "request_id": request_id,
-        "live_status": state
+        "status": state
     }
 
 # ----------------------------
@@ -296,7 +297,15 @@ def work():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-    publish_message(message)
+    connection = connect_rabbitmq()
+    channel = connection.channel()
+    channel.queue_declare(queue="workflow_queue_b")
+
+    channel.basic_publish(
+        exchange="",
+        routing_key="workflow_queue_b",
+        body=json.dumps(message)
+    )
 
     log_event(
         level="info",
@@ -313,12 +322,14 @@ def work():
         "event published to workflow_queue_b"
     )
 
+    connection.close() # ensure rmq connection is closed after publishing
+
     return {
         "trace_id": trace_id,
         "request_id": request_id,
         "message": "workflow started",
         "next_steps": {
-            "live_status": f"/status/{request_id}",
+            "status": f"/status/{request_id}",
             "workflow_history": f"/workflow/{request_id}",
             "final_result": f"/result/{request_id}"
         }

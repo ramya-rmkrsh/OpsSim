@@ -91,5 +91,48 @@ services:
       retries: 10
       start_period: 10s 
 
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  tempo:
+    image: grafana/tempo:latest
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo/tempo.yml
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    volumes:
+      - ./otel/otel-collector.yml:/etc/otel/config.yaml
+
+  loki:
+      image: grafana/loki:latest
+      ports:
+        - "3100:3100"
+      volumes:
+        - ./loki/loki-config.yml:/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./promtail/promtail-config.yml:/etc/promtail/config.yml
+        
 volumes:
   postgres_data:
+  grafana_data: 

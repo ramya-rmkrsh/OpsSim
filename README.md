@@ -66,7 +66,7 @@ A containerized event-driven microservice pipeline built to simulate and observe
 | service-a | FastAPI — workflow entry point, status API, system health aggregator | 8001 |
 | service-b | RabbitMQ consumer — processes workflow, publishes to service-c | — |
 | service-c | RabbitMQ consumer — calls external API, writes final state | — |
-| external-api | Simulated third-party API called by service-c | 8004 |
+| external-api | Simulated third-party API called by service-c | 8003 |
 | RabbitMQ | Message broker between services | 5672 / 15672 |
 | Redis | Workflow state store + service readiness keys | 6379 |
 | Postgres | Persistent audit log of all workflow events | 5432 |

@@ -54,7 +54,7 @@ services:
   external-api:
     build: ./external-api
     ports:
-      - "8004:8004"
+      - "8003:8003"
 
   redis:
     image: redis:7

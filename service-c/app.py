@@ -9,19 +9,45 @@ import psycopg2
 import requests
 import threading
 
-#----------------------------
-# Service Status 
-#----------------------------
-SERVICE_STATUS = {
-    "service": "service-c",
-    "ready": False,
-    "dependencies": {
-        "redis": False,
-        "postgres": False,
-        "rabbitmq": False,
-        "external_api": False
-    }
-}
+from prometheus_client import Histogram, start_http_server
+
+from opentelemetry import trace
+from opentelemetry.instrumentation.redis import RedisInstrumentor
+from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+
+from opentelemetry.propagate import inject, extract
+from opentelemetry.trace import SpanKind
+
+# ----------------------------
+# Auto instrumentation
+# ----------------------------
+RedisInstrumentor().instrument()
+Psycopg2Instrumentor().instrument()
+RequestsInstrumentor().instrument()
+
+# ----------------------------
+# OpenTelemetry Setup (Tempo via Collector)
+# ----------------------------
+resource = Resource.create({"service.name": "service-c"})
+
+provider = TracerProvider(resource=resource)
+provider.add_span_processor(
+    BatchSpanProcessor(
+        OTLPSpanExporter(
+            endpoint="http://otel-collector:4317",
+            insecure=True
+        )
+    )
+)
+
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("service-c")
 
 # ----------------------------
 # Logging
@@ -35,10 +61,23 @@ logging.basicConfig(
 logger = logging.getLogger("service-c")
 
 # ----------------------------
-# Postgres Connection
+# Service Status
+# ----------------------------
+SERVICE_STATUS = {
+    "service": "service-c",
+    "ready": False,
+    "dependencies": {
+        "redis": False,
+        "postgres": False,
+        "rabbitmq": False,
+        "external_api": False
+    }
+}
+
+# ----------------------------
+# Postgres
 # ----------------------------
 def get_db_connection():
-
     return psycopg2.connect(
         host="postgres",
         database="opssim",
@@ -46,9 +85,6 @@ def get_db_connection():
         password="opspassword"
     )
 
-#----------------------------
-# Postgres Health Check
-#----------------------------
 def check_postgres():
     try:
         conn = get_db_connection()
@@ -56,71 +92,60 @@ def check_postgres():
         return True
     except:
         return False
-    
+
 # ----------------------------
 # Redis
 # ----------------------------
-r = redis.Redis(
-    host="redis",
-    port=6379,
-    decode_responses=True
-)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-#----------------------------
-# Redis Health Check
-#----------------------------
 def check_redis():
     try:
         r.ping()
         return True
-    except Exception:
+    except:
         return False
 
 # ----------------------------
-# External API Health Check
+# External API
 # ----------------------------
 def check_external_api():
     try:
-        response = requests.get(
+        res = requests.get(
             "http://external-api:8003/health", 
             timeout=2
         )
-        return response.status_code == 200
-    
-    except Exception:
-
+        return res.status_code == 200
+    except:
         return False
 
 # ----------------------------
-# RabbitMQ connection holder and readiness check
+# RabbitMQ
 # ----------------------------
 rmq_connection = None
- 
+
 def check_rabbitmq():
     try:
         return rmq_connection is not None and rmq_connection.is_open
-    except Exception:
+    except:
         return False
- 
+
 # ----------------------------
-# Readiness Check
+# Ready check
 # ----------------------------
 def ready():
     SERVICE_STATUS["dependencies"]["redis"] = check_redis()
     SERVICE_STATUS["dependencies"]["postgres"] = check_postgres()
     SERVICE_STATUS["dependencies"]["rabbitmq"] = check_rabbitmq()
     SERVICE_STATUS["dependencies"]["external_api"] = check_external_api()
- 
+
     SERVICE_STATUS["ready"] = all(SERVICE_STATUS["dependencies"].values())
- 
     r.set("service-c:ready", json.dumps(SERVICE_STATUS), ex=60)
     return SERVICE_STATUS
- 
+
 # ----------------------------
-# Heartbeat to check dependencies and update status in Redis
+# Heartbeat
 # ----------------------------
 def heartbeat_loop():
-    
     while True:
         try:
             ready()
@@ -129,7 +154,7 @@ def heartbeat_loop():
         time.sleep(10)
 
 # ----------------------------
-# Retry Config (NEW)
+# Retry logic
 # ----------------------------
 MAX_RETRIES = 3
 RETRY_KEY_PREFIX = "retry:"
@@ -139,14 +164,13 @@ def get_retry_count(request_id):
 
 def increment_retry(request_id):
     count = get_retry_count(request_id) + 1
-    r.set(f"{RETRY_KEY_PREFIX}{request_id}", count)
+    r.set(f"{RETRY_KEY_PREFIX}{request_id}", count, ex=3600)
     return count
 
 # ----------------------------
-# Structured Logging
+# Logging helper
 # ----------------------------
 def log_event(level, trace_id, request_id, state, message):
-
     log_data = {
         "timestamp": datetime.utcnow().isoformat(),
         "trace_id": trace_id,
@@ -155,16 +179,13 @@ def log_event(level, trace_id, request_id, state, message):
         "state": state,
         "message": message
     }
-
     print(json.dumps(log_data), flush=True)
 
 # ----------------------------
-# Persist Workflow Event
+# DB persist
 # ----------------------------
 def persist_event(trace_id, request_id, state, message):
-
     conn = get_db_connection()
-
     cur = conn.cursor()
 
     cur.execute("""
@@ -174,233 +195,176 @@ def persist_event(trace_id, request_id, state, message):
             service_name,
             state,
             message
-        )
-        VALUES (%s, %s, %s, %s, %s)
-    """, (
-        trace_id,
-        request_id,
-        "service-c",
-        state,
-        message
-    ))
+        ) VALUES (%s, %s, %s, %s, %s)
+    """, (trace_id, request_id, "service-c", state, message))
 
     conn.commit()
-
     cur.close()
     conn.close()
 
 # ----------------------------
-# DLQ 
+# DLQ
 # ----------------------------
 def send_to_dlq(ch, message):
+    headers = {}
+    inject(headers)
 
     ch.basic_publish(
         exchange="",
         routing_key="workflow_dlq",
-        body=json.dumps(message)
+        body=json.dumps(message),
+        properties=pika.BasicProperties(headers=headers)
     )
 
 # ----------------------------
-# Consumer Callback
+# Metrics
+# ----------------------------
+workflow_latency = Histogram(
+    "workflow_duration_seconds",
+    "End to end workflow duration",
+    buckets=[0.1, 0.5, 1, 2, 5, 10]
+)
+
+# ----------------------------
+# Consumer Callback (FIXED TRACING)
 # ----------------------------
 def callback(ch, method, properties, body):
 
     message = json.loads(body)
-
-    trace_id = message["trace_id"]
     request_id = message["request_id"]
 
-    # ----------------------------
-    # PROCESSING C
-    # ----------------------------
-    log_event(
-        level="info",
-        trace_id=trace_id,
-        request_id=request_id,
-        state="PROCESSING_C",
-        message="message consumed from workflow_queue_c"
-    )
-    
-    # persist event to Postgres
-    persist_event(
-        trace_id,
-        request_id,
-        "PROCESSING_C",
-        "workflow consumed by workflow_queue_c"
-    )
+    # ✅ FIX: extract parent context from RabbitMQ headers
+    context = extract(properties.headers if properties else {})
 
-    # update redis state
-    r.set(f"workflow:{request_id}", "PROCESSING_C")
+    with workflow_latency.time():
 
-    # simulate processing delay
-    time.sleep(random.randint(1, 3))
+        with tracer.start_as_current_span(
+            "rmq.consume",
+            context=context,
+            kind=SpanKind.CONSUMER
+        ) as span:
 
-    # ----------------------------
-    # FAILURE SIMULATION (NEW)
-    # ----------------------------
-    should_fail = random.randint(1, 10) > 8
+            span.set_attribute("queue", "workflow_queue_c")
+            span.set_attribute("request_id", request_id)
 
-    if should_fail:
+            trace_id = format(span.get_span_context().trace_id, "032x")
 
-        retry_count = increment_retry(request_id)
+            log_event("info", trace_id, request_id, "PROCESSING_C",
+                      "message consumed from workflow_queue_c")
 
-        r.set(f"workflow:{request_id}", "FAILED_C")
+            # ---------------- DB SPAN ----------------
+            with tracer.start_as_current_span("db.persist"):
+                persist_event(trace_id, request_id,
+                              "PROCESSING_C",
+                              "workflow consumed by service c")
 
-        log_event(
-            level="error",
-            trace_id=trace_id,
-            request_id=request_id,
-            state="FAILED_C",
-            message=f"service-c failed (retry {retry_count}/{MAX_RETRIES})"
-        )
+            # ---------------- REDIS SPAN ----------------
+            with tracer.start_as_current_span("redis.set"):
+                r.set(f"workflow:{request_id}", "PROCESSING_C", ex=3600)
 
-        persist_event(
-            trace_id,
-            request_id,
-            "FAILED_C",
-            f"workflow failed in service c (retry {retry_count}/{MAX_RETRIES})"
-        )
+            time.sleep(random.randint(1, 3))
 
-        # ----------------------------
-        # RETRY LOGIC (NEW)
-        # ----------------------------
-        if retry_count <= MAX_RETRIES:
+            # ---------------- FAILURE SIMULATION ----------------
+            should_fail = random.randint(1, 10) > 8
 
-            log_event(
-                level="warning",
-                trace_id=trace_id,
-                request_id=request_id,
-                state="RETRY_C",
-                message=f"retrying service-c ({retry_count}/{MAX_RETRIES})"
-            )
+            if should_fail:
+                retry_count = increment_retry(request_id)
 
-            ch.basic_publish(
-                exchange="",
-                routing_key="workflow_queue_c",
-                body=json.dumps(message)
-            )
+                state = "FAILED_C"
+                log_event("error", trace_id, request_id, state,
+                          f"retry {retry_count}/{MAX_RETRIES}")
 
-        else:
+                persist_event(trace_id, request_id, state,
+                              f"failed retry {retry_count}")
 
-            send_to_dlq(ch, message)
+                if retry_count <= MAX_RETRIES:
 
-            log_event(
-                level="error",
-                trace_id=trace_id,
-                request_id=request_id,
-                state="DLQ_C",
-                message="max retries exceeded, sent to DLQ"
-            )
+                    headers = properties.headers.copy() if properties and properties.headers else {}
+                    inject(headers)
 
-        return
+                    ch.basic_publish(
+                        exchange="",
+                        routing_key="workflow_queue_c",
+                        body=json.dumps(message),
+                        properties=pika.BasicProperties(headers=headers)
+                    )
 
-    # ----------------------------
-    # EXTERNAL API CALL (SUCCESS PATH)
-    # ----------------------------
-    try:
+                else:
+                    send_to_dlq(ch, message)
+                    log_event("error", trace_id, request_id,
+                              "DLQ_C", "max retries exceeded")
 
-        response = requests.get(
-            "http://external-api:8003/process",
-            params={"request_id": request_id},
-            timeout=2
-        )
+                return
 
-        if response.status_code == 200 and response.json().get("status") == "SUCCESS":
+            # ---------------- EXTERNAL API ----------------
+            try:
+                response = requests.get(
+                    "http://external-api:8003/process",
+                    params={"request_id": request_id},
+                    timeout=2
+                )
 
-            state_text = "COMPLETED_C"
-            message_text = "external API call succeeded"
-            log_level = "info"
+                if response.status_code == 200 and response.json().get("status") == "SUCCESS":
+                    state = "COMPLETED_C"
+                    msg = "external API success"
+                    level = "info"
+                else:
+                    state = "FAILED_C"
+                    msg = "external API failed"
+                    level = "error"
 
-        else:
+            except Exception as e:
+                state = "ERRORED_C"
+                msg = str(e)
+                level = "error"
 
-            state_text = "FAILED_C"
-            message_text = "external API call failed"
-            log_level = "error"
+            # ---------------- FINAL UPDATE ----------------
+            r.set(f"workflow:{request_id}", state, ex=3600)
 
-    except Exception as e:
+            log_event(level, trace_id, request_id, state, msg)
 
-        state_text = "ERRORED_C"
-        message_text = f"external API error: {str(e)}"
-        log_level = "error"
+            persist_event(trace_id, request_id, state, msg)
 
-    # ----------------------------
-    # FINAL STATE UPDATE
-    # ----------------------------
-    r.set(f"workflow:{request_id}", state_text)
-
-    log_event(
-        level=log_level,
-        trace_id=trace_id,
-        request_id=request_id,
-        state=state_text,
-        message=message_text
-    )
-
-    persist_event(
-        trace_id,
-        request_id,
-        state_text,
-        message_text
-    )
-
-    # ----------------------------
-    # REDIS CLEANUP  (keep visibility longer now)
-    # ----------------------------
-    r.expire(f"workflow:{request_id}", 3600)
-
-    log_event(
-        level="info",
-        trace_id=trace_id,
-        request_id=request_id,
-        state="CACHE_CLEANUP",
-        message="redis workflow cache set to expire"
-    )
-
-    persist_event(
-        trace_id,
-        request_id,
-        "CACHE_CLEANUP",
-        "workflow marked for cleanup"
-    )
+            r.expire(f"workflow:{request_id}", 3600)
 
 # ----------------------------
-# RabbitMQ Connection
+# RabbitMQ connection
 # ----------------------------
 def connect_rabbitmq():
     global rmq_connection
     while True:
         try:
-            logger.info("Attempting RabbitMQ connection...")
+            logger.info("Connecting to RabbitMQ...")
             rmq_connection = pika.BlockingConnection(
                 pika.ConnectionParameters(host="rabbitmq")
             )
-            logger.info("Connected to RabbitMQ")
+            logger.info("RabbitMQ connected")
             SERVICE_STATUS["dependencies"]["rabbitmq"] = True
             return rmq_connection
-        except pika.exceptions.AMQPConnectionError:
-            logger.error("RabbitMQ not ready. Retrying in 5 seconds...")
+        except:
             SERVICE_STATUS["dependencies"]["rabbitmq"] = False
             time.sleep(5)
- 
+
 # ----------------------------
-# Start Consumer
+# Start system
 # ----------------------------
+start_http_server(8001)
+
 connection = connect_rabbitmq()
 channel = connection.channel()
- 
+
 channel.queue_declare(queue="workflow_queue_c")
 channel.queue_declare(queue="workflow_dlq")
- 
-ready()   # write initial ready state after full setup
+
+ready()
 
 channel.basic_consume(
     queue="workflow_queue_c",
     on_message_callback=callback,
     auto_ack=True
 )
- 
+
 threading.Thread(target=heartbeat_loop, daemon=True).start()
 
-logger.info("service-c waiting for RabbitMQ messages...")
-
+logger.info("service-c waiting for messages...")
 channel.start_consuming()

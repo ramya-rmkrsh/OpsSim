@@ -1,3 +1,5 @@
+from pyexpat.errors import messages
+
 from fastapi import FastAPI
 import logging
 import redis
@@ -7,6 +9,44 @@ import json
 import psycopg2
 import time
 from datetime import datetime
+
+# OpenTelemetry and Prometheus imports to instrument Redis, Postgres, and FastAPI, and to expose metrics
+from opentelemetry import trace
+from opentelemetry.instrumentation.redis import RedisInstrumentor
+from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Histogram, start_http_server
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor #FastAPI instrumentation automatically creates spans for incoming requests
+
+# OpenTelemetry Tracing Setup to send traces to OpenTelemetry Collector
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.trace import get_current_span
+from opentelemetry.propagate import inject #to propagate trace context in RabbitMQ messages
+
+app = FastAPI()
+
+# one line each — auto-instruments everything
+Instrumentator().instrument(app).expose(app)
+RedisInstrumentor().instrument()
+Psycopg2Instrumentor().instrument()
+
+# identify this service
+resource = Resource.create({"service.name": "service-a"})
+
+# set up the exporter pointing to otel-collector
+provider = TracerProvider(resource=resource)
+provider.add_span_processor(
+    BatchSpanProcessor(
+        OTLPSpanExporter(endpoint="http://otel-collector:4317", insecure=True)
+    )
+)
+
+trace.set_tracer_provider(provider)
+
+FastAPIInstrumentor.instrument_app(app) # automatically instruments FastAPI routes with spans for incoming requests to OTEL-Collector
 
 # ----------------------------
 # Logging Configuration
@@ -18,9 +58,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("service-a")
-
-app = FastAPI()
-
+tracer = trace.get_tracer(__name__)
 # ----------------------------
 # Redis Connection
 # ----------------------------
@@ -112,6 +150,11 @@ def persist_event(trace_id, request_id, state, message):
 
     cur.close()
     conn.close()
+
+# ----------------------------
+# Start Prometheus Metrics Server
+# ----------------------------
+start_http_server(8090)  # exposes /metrics — use a different port e.g. 8090 to avoid conflict with uvicorn
 
 # ----------------------------
 # Health Check Endpoint
@@ -263,75 +306,95 @@ def get_result(request_id: str):
         "workflow_completed": state in FINAL_STATES
     }
 
+workflow_latency = Histogram(
+    'workflow_duration_seconds',
+    'End to end workflow duration',
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+)
+
 # ----------------------------
 # Workflow entry point
 # ----------------------------
 @app.get("/work")
 def work():
 
-    request_id = str(uuid.uuid4())
-    trace_id = str(uuid.uuid4())
+     with workflow_latency.time():   # starts timer when callback begins
+        
+        with tracer.start_as_current_span("workflow.start") as span:
 
-    # workflow started
-    r.set(f"workflow:{request_id}", "PROCESSING_A")
+            request_id = str(uuid.uuid4())
 
-    log_event(
-        level="info",
-        trace_id=trace_id,
-        request_id=request_id,
-        state="PROCESSING_A",
-        message="workflow received"
-    )
+            trace_id = format(
+                span.get_span_context().trace_id,
+                "032x"
+            )
 
-    persist_event(
-        trace_id,
-        request_id,
-        "PROCESSING_A",
-        "workflow received"
-    )
+        # workflow started
+        r.set(f"workflow:{request_id}", "PROCESSING_A", ex=3600)
+         
+        log_event(
+            level="info",
+            trace_id=trace_id,
+            request_id=request_id,
+            state="PROCESSING_A",
+            message="workflow received"
+        )
 
-    # publish event to RabbitMQ
-    message = {
-        "trace_id": trace_id,
-        "request_id": request_id,
-        "state": "PROCESSING_B",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+        persist_event(
+            trace_id,
+            request_id,
+            "PROCESSING_A",
+            "workflow received"
+        )
 
-    connection = connect_rabbitmq()
-    channel = connection.channel()
-    channel.queue_declare(queue="workflow_queue_b")
-
-    channel.basic_publish(
-        exchange="",
-        routing_key="workflow_queue_b",
-        body=json.dumps(message)
-    )
-
-    log_event(
-        level="info",
-        trace_id=trace_id,
-        request_id=request_id,
-        state="PUBLISHED_TO_B",
-        message="event published to workflow_queue_b"
-    )
-
-    persist_event(
-        trace_id,
-        request_id,
-        "PUBLISHED_TO_B",
-        "event published to workflow_queue_b"
-    )
-
-    connection.close() # ensure rmq connection is closed after publishing
-
-    return {
-        "trace_id": trace_id,
-        "request_id": request_id,
-        "message": "workflow started",
-        "next_steps": {
-            "status": f"/status/{request_id}",
-            "workflow_history": f"/workflow/{request_id}",
-            "final_result": f"/result/{request_id}"
+        # publish event to RabbitMQ
+        message = {
+            "trace_id": trace_id,
+            "request_id": request_id,
+            "state": "PROCESSING_B",
+            "timestamp": datetime.utcnow().isoformat()
         }
-    }
+
+        connection = connect_rabbitmq()
+        channel = connection.channel()
+        channel.queue_declare(queue="workflow_queue_b")
+
+        headers = {} # create empty headers dict to inject trace context for propagation to service-b via RabbitMQ message
+        inject(headers) # injects current trace context into headers dict so that it can be propagated to downstream services via RabbitMQ message headers
+
+        channel.basic_publish(
+            exchange="",
+            routing_key="workflow_queue_b",
+            body=json.dumps(message),
+            properties=pika.BasicProperties( # include trace context in message headers for propagation to service-b
+                headers=headers
+            )
+        )
+
+        log_event(
+            level="info",
+            trace_id=trace_id,
+            request_id=request_id,
+            state="PUBLISHED_TO_B",
+            message="event published to workflow_queue_b"
+        )
+
+        persist_event(
+            trace_id,
+            request_id,
+            "PUBLISHED_TO_B",
+            "event published to workflow_queue_b"
+        )
+
+        connection.close() # ensure rmq connection is closed after publishing
+
+        return {
+            "trace_id": trace_id,
+            "request_id": request_id,
+            "message": "workflow started",
+            "next_steps": {
+                "status": f"/status/{request_id}",
+                "workflow_history": f"/workflow/{request_id}",
+                "final_result": f"/result/{request_id}"
+            }
+        }

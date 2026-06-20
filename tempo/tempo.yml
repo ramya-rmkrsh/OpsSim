@@ -49,7 +49,3 @@ metrics_generator:
 
   storage:
     path: /var/tempo/generator/wal
-
-  # OPTIONAL but REQUIRED if you want metrics outside Tempo
-  # remote_write:
-  #   - url: http://prometheus:9090/api/v1/write

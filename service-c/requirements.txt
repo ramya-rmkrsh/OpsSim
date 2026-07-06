@@ -3,3 +3,11 @@ requests
 logging
 pika
 psycopg2-binary
+opentelemetry-exporter-otlp
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-redis
+opentelemetry-instrumentation-psycopg2
+opentelemetry-instrumentation-requests
+prometheus-client
+opentelemetry-exporter-otlp-proto-grpc

@@ -5,3 +5,11 @@ requests
 logging
 pika
 psycopg2-binary
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-redis
+opentelemetry-instrumentation-psycopg2
+prometheus-client
+prometheus-fastapi-instrumentator
+opentelemetry-exporter-otlp-proto-grpc

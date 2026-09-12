@@ -102,12 +102,10 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
     depends_on:
-    #  - prometheus
-    #  - loki
+      - prometheus
+      - loki
       - tempo
     restart: unless-stopped
-    # networks:
-    #   - observability
 
   tempo:
     image: grafana/tempo:2.7.2
@@ -121,8 +119,6 @@ services:
       - tempo-data:/var/tempo
     command: ["-config.file=/etc/tempo/tempo.yml"]
     restart: unless-stopped
-    # networks:
-    #   - observability
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -131,48 +127,37 @@ services:
     volumes:
       - ./otel/otel-collector.yml:/etc/otel/config.yaml
     command: ["--config=/etc/otel/config.yaml"]
-    # networks:
-    #  - observability
 
-  # prometheus:
-  #   image: prom/prometheus:latest
-  #   ports:
-  #     - "9090:9090"
-  #   volumes:
-  #     - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-  #   restart: unless-stopped
-  #   networks:
-  #     - observability
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    restart: unless-stopped
 
-  # loki:
-  #     image: grafana/loki:2.9.0
-  #     ports:
-  #       - "3100:3100"
-  #     user: "0"
-  #     command: -config.file=/etc/loki/local-config.yaml
-  #     volumes:
-  #       - ./loki/loki-config.yml:/etc/loki/local-config.yaml
-  #       - loki_data:/var/loki
-  #     restart: unless-stopped
-  #     networks:
-  #       - observability
+  loki:
+      image: grafana/loki:2.9.0
+      ports:
+        - "3100:3100"
+      user: "0"
+      command: -config.file=/etc/loki/local-config.yaml
+      volumes:
+        - ./loki/loki-config.yml:/etc/loki/local-config.yaml
+        - loki_data:/var/loki
+      restart: unless-stopped
 
-  # promtail:
-  #   image: grafana/promtail:latest
-  #   volumes:
-  #     - /var/lib/docker/containers:/var/lib/docker/containers:ro
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #     - ./promtail/promtail-config.yml:/etc/promtail/config.yml
-  #   command:
-  #   - -config.file=/etc/promtail/config.yml
-  #   networks:
-  #     - observability
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./promtail/promtail-config.yml:/etc/promtail/config.yml
+    command:
+    - -config.file=/etc/promtail/config.yml
 
 volumes:
   postgres_data:
   grafana_data:
   tempo-data:
-#  loki_data:
-
-# networks:
-  # observability:
+  loki_data:

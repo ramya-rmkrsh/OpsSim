@@ -26,7 +26,11 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.trace import get_current_span
 from opentelemetry.propagate import inject #to propagate trace context in RabbitMQ messages
 
+from prometheus_client import Counter, Histogram, make_asgi_app
+
 app = FastAPI()
+
+app.mount("/metrics", make_asgi_app())
 
 # one line each — auto-instruments everything
 Instrumentator().instrument(app).expose(app)
@@ -122,6 +126,19 @@ def log_event(level, component, operation, trace_id, request_id, state, message)
     }
 
     print(json.dumps(log_data), flush=True)
+
+#----------------------------
+# Prometheus Metrics
+#----------------------------
+
+workflow_transitions = Counter(
+    "opssim_workflow_transitions_total", "Count of workflow state transitions",
+    ["service", "state"]
+)
+workflow_duration = Histogram(
+    "opssim_workflow_stage_duration_seconds", "Time spent in each stage",
+    ["service", "operation"]
+)
 
 # ----------------------------
 # Persist Workflow Event
@@ -300,7 +317,6 @@ def workflow_history(request_id: str):
 FINAL_STATES = [
     "FAILED_B",
     "FAILED_C",
-    "ERRORED_C",
     "COMPLETED_C"
 ]
 
@@ -349,7 +365,7 @@ def work():
             trace_id,
             request_id,
             "PROCESSING_A",
-            "workflow received at service-a"
+            "workflow started at service-a"
         )
 
         # persist_event(
@@ -358,6 +374,9 @@ def work():
         #     "PROCESSING_A",
         #     "workflow received at service-a"
         # ) 
+
+        # increment Prometheus counter for workflow transition to PROCESSING_A
+        workflow_transitions.labels("service-a", "PROCESSING_A").inc()
 
         # publish event to RabbitMQ
         message = {
@@ -400,6 +419,9 @@ def work():
         #     "PUBLISHED_TO_B",
         #     "event published to workflow_queue_b"
         # )
+
+        # increment Prometheus counter for workflow transition to PUBLISHED_TO_B
+        workflow_transitions.labels("service-a", "PUBLISHED_TO_B").inc()
 
         connection.close() # ensure rmq connection is closed after publishing
 

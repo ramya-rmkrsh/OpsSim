@@ -25,6 +25,9 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.propagate import inject, extract
 from opentelemetry.trace import SpanKind
 
+from prometheus_client import Counter, Histogram, start_http_server
+start_http_server(9100) # Start Prometheus metrics server on port 9100
+
 # ----------------------------
 # Auto instrumentation
 # ----------------------------
@@ -187,6 +190,17 @@ def log_event(level, component, operation, trace_id, request_id, state, message)
     print(json.dumps(log_data), flush=True)
 
 #----------------------------
+# Prometheus Metrics
+#----------------------------
+workflow_transitions = Counter(
+    "opssim_workflow_transitions_total", "Count of workflow state transitions",
+    ["service", "state"]
+)
+retry_count_metric = Counter(
+    "opssim_retries_total", "Retry attempts", ["service"]
+)
+
+#----------------------------
 # RabbitMQ Publish with Tracing
 #----------------------------
 
@@ -265,7 +279,7 @@ def send_to_dlq(channel, message, trace_id, request_id, existing_headers):
     persist_event(
         trace_id,
         request_id,
-        "ERRORED_C",
+        "FAILED_C",
         "Message sent to DLQ"
     )
         
@@ -276,7 +290,7 @@ def send_to_dlq(channel, message, trace_id, request_id, existing_headers):
         trace_id, 
         request_id,
         existing_headers,
-        "ERRORED_C",
+        "FAILED_C",
         "Message sent to DLQ"
     )
 
@@ -343,6 +357,8 @@ def callback(ch, method, properties, body):
 
                 retry_count = increment_retry(request_id)
 
+                retry_count_metric.labels("service-c").inc()
+
                 state = "FAILED_C"
 
                 with tracer.start_as_current_span("redis.set"):
@@ -379,6 +395,7 @@ def callback(ch, method, properties, body):
                      )
 
                 else:
+                    workflow_transitions.labels("service-c", "ERRORED_C").inc()
                     send_to_dlq(ch, message, trace_id, request_id, properties.headers)
                 return
 
@@ -405,12 +422,12 @@ def callback(ch, method, properties, body):
                         msg = "external API success"
                         level = "info"
                     else:
-                        state = "ERRORED_C"
+                        state = "FAILED_C"
                         msg = "external API failed"
                         level = "error"
 
                 except Exception as e:
-                    state = "ERRORED_C"
+                    state = "FAILED_C"
                     msg = str(e)
                     level = "error"
                     api_span.record_exception(e)
@@ -436,6 +453,8 @@ def callback(ch, method, properties, body):
                     state, 
                     msg
                 )
+
+            workflow_transitions.labels("service-c", state).inc()
 
             r.expire(f"workflow:{request_id}", 3600)
 

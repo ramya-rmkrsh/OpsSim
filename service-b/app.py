@@ -23,6 +23,9 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.propagate import inject, extract
 from opentelemetry.trace import SpanKind
 
+from prometheus_client import Counter, Histogram, start_http_server
+start_http_server(9100) # Start Prometheus metrics server on port 9100
+
 # ----------------------------
 # Auto instrumentation
 # ----------------------------
@@ -156,6 +159,17 @@ def log_event(level, component, operation, trace_id, request_id, state, message)
     print(json.dumps(log_data), flush=True)
 
 #----------------------------
+# Prometheus Metrics
+#----------------------------
+workflow_transitions = Counter(
+    "opssim_workflow_transitions_total", "Count of workflow state transitions",
+    ["service", "state"]
+)
+retry_count_metric = Counter(
+    "opssim_retries_total", "Retry attempts", ["service"]
+)
+
+#----------------------------
 # RabbitMQ Publish with Tracing
 #----------------------------
 
@@ -221,7 +235,7 @@ def persist_event(trace_id, request_id, state, message):
         request_id, 
         state,
         message
-        ) 
+    ) 
    
     conn.commit()
     cur.close()
@@ -237,6 +251,7 @@ def get_retry_count(request_id):
     return int(r.get(f"{RETRY_KEY_PREFIX}{request_id}") or 0)
 
 def increment_retry(request_id):
+    retry_count_metric.labels("service-b").inc()
     count = get_retry_count(request_id) + 1
     r.set(f"{RETRY_KEY_PREFIX}{request_id}", count, ex=3600)
     return count
@@ -249,8 +264,8 @@ def send_to_dlq(channel, message, trace_id, request_id, existing_headers):
     persist_event(
         trace_id,
         request_id,
-        "DLQ",
-        "Message sent to Service-B DLQ"
+        "FAILED_B",
+        "Message sent to DLQ"
     )
 
     publish_message(
@@ -260,7 +275,7 @@ def send_to_dlq(channel, message, trace_id, request_id, existing_headers):
         trace_id, 
         request_id,
         existing_headers,
-        "DLQ"
+        "FAILED_B"
         "Message sent to DLQ"
     )
 
@@ -327,6 +342,8 @@ def callback(ch, method, properties, body):
 
                 retry_count = increment_retry(request_id)
 
+                retry_count_metric.labels("service-b").inc()
+
                 state = "FAILED_B"
 
                 with tracer.start_as_current_span("redis.set"):
@@ -365,6 +382,7 @@ def callback(ch, method, properties, body):
                     r.expire(f"workflow:{request_id}", 3600)
 
                 else:
+                    workflow_transitions.labels("service-b", "DLQ").inc()
                     send_to_dlq(ch, message, trace_id, request_id, properties.headers)
                 return
 
@@ -388,6 +406,8 @@ def callback(ch, method, properties, body):
                     "COMPLETED_B",
                     "success in service-b"
                 )
+
+            workflow_transitions.labels("service-b", "COMPLETED_B").inc()
 
             # ---------------- SEND TO C ----------------
             next_message = {

@@ -66,13 +66,15 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+      - "15692:15692"   # Prometheus metrics endpoint
+    command: ["sh", "-c", "rabbitmq-plugins enable --offline rabbitmq_prometheus && rabbitmq-server"]
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
       interval: 10s
       timeout: 10s
       retries: 15
       start_period: 30s
-
+ 
   postgres:
     image: postgres:15
     environment:
@@ -155,6 +157,20 @@ services:
       - ./promtail/promtail-config.yml:/etc/promtail/config.yml
     command:
     - -config.file=/etc/promtail/config.yml
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: redis-exporter
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    ports:
+      - "9121:9121"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
 
 volumes:
   postgres_data:

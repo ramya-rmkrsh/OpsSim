@@ -15,6 +15,7 @@ from opentelemetry import trace
 from opentelemetry.instrumentation.redis import RedisInstrumentor
 from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.trace import Status, StatusCode
 
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -23,6 +24,9 @@ from opentelemetry.sdk.resources import Resource
 
 from opentelemetry.propagate import inject, extract
 from opentelemetry.trace import SpanKind
+
+from prometheus_client import Counter, Histogram, start_http_server
+start_http_server(9100) # Start Prometheus metrics server on port 9100
 
 # ----------------------------
 # Auto instrumentation
@@ -157,7 +161,7 @@ def heartbeat_loop():
 # Retry logic
 # ----------------------------
 MAX_RETRIES = 3
-RETRY_KEY_PREFIX = "retry:"
+RETRY_KEY_PREFIX = "retry:service-c:"
 
 def get_retry_count(request_id):
     return int(r.get(f"{RETRY_KEY_PREFIX}{request_id}") or 0)
@@ -170,16 +174,65 @@ def increment_retry(request_id):
 # ----------------------------
 # Logging helper
 # ----------------------------
-def log_event(level, trace_id, request_id, state, message):
+def log_event(level, component, operation, trace_id, request_id, state, message):
     log_data = {
+        "level": level,
         "timestamp": datetime.utcnow().isoformat(),
+        "service": "service-c",
+        "component": component,
+        "operation": operation,
+        "state": state,
+        "message": message,
         "trace_id": trace_id,
         "request_id": request_id,
-        "service": "service-c",
-        "state": state,
-        "message": message
+
     }
     print(json.dumps(log_data), flush=True)
+
+#----------------------------
+# Prometheus Metrics
+#----------------------------
+workflow_transitions = Counter(
+    "opssim_workflow_transitions_total", "Count of workflow state transitions",
+    ["service", "state"]
+)
+retry_count_metric = Counter(
+    "opssim_retries_total", "Retry attempts", ["service"]
+)
+
+#----------------------------
+# RabbitMQ Publish with Tracing
+#----------------------------
+
+def publish_message(channel, routing_key, message, trace_id, request_id, existing_headers=None, state=None, log_message=None):
+    with tracer.start_as_current_span(
+        "rmq.publish",
+        kind=SpanKind.PRODUCER
+    ) as span:
+        span.set_attribute("messaging.system", "rabbitmq")
+        span.set_attribute("messaging.destination", routing_key)
+        span.set_attribute("messaging.operation", "publish")
+        span.set_attribute("request_id", request_id)
+
+        headers = existing_headers.copy() if existing_headers else {}
+        inject(headers)  # inject AFTER span is active so it propagates the publish span, not the consume span
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=routing_key,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(headers=headers)
+        )
+
+        log_event(
+            "info",
+            "rmq", 
+            "publish", 
+            trace_id, 
+            request_id,
+            state,
+            log_message
+        )
 
 # ----------------------------
 # DB persist
@@ -195,8 +248,25 @@ def persist_event(trace_id, request_id, state, message):
             service_name,
             state,
             message
-        ) VALUES (%s, %s, %s, %s, %s)
-    """, (trace_id, request_id, "service-c", state, message))
+        )
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        trace_id,
+        request_id,
+        "service-c",
+        state,
+        message
+    ))
+
+    log_event(
+        "info",
+        "db",
+        "insert",
+        trace_id,
+        request_id,
+        state,
+        message
+    )
 
     conn.commit()
     cur.close()
@@ -205,15 +275,23 @@ def persist_event(trace_id, request_id, state, message):
 # ----------------------------
 # DLQ
 # ----------------------------
-def send_to_dlq(ch, message):
-    headers = {}
-    inject(headers)
-
-    ch.basic_publish(
-        exchange="",
-        routing_key="workflow_dlq",
-        body=json.dumps(message),
-        properties=pika.BasicProperties(headers=headers)
+def send_to_dlq(channel, message, trace_id, request_id, existing_headers):
+    persist_event(
+        trace_id,
+        request_id,
+        "FAILED_C",
+        "Message sent to DLQ"
+    )
+        
+    publish_message(
+        channel,
+        "workflow_dlq", 
+        message, 
+        trace_id, 
+        request_id,
+        existing_headers,
+        "FAILED_C",
+        "Message sent to DLQ"
     )
 
 # ----------------------------
@@ -249,81 +327,134 @@ def callback(ch, method, properties, body):
 
             trace_id = format(span.get_span_context().trace_id, "032x")
 
-            log_event("info", trace_id, request_id, "PROCESSING_C",
-                      "message consumed from workflow_queue_c")
-
-            # ---------------- DB SPAN ----------------
-            with tracer.start_as_current_span("db.persist"):
-                persist_event(trace_id, request_id,
-                              "PROCESSING_C",
-                              "workflow consumed by service c")
-
             # ---------------- REDIS SPAN ----------------
             with tracer.start_as_current_span("redis.set"):
                 r.set(f"workflow:{request_id}", "PROCESSING_C", ex=3600)
-
+                log_event(
+                    "info", 
+                    "redis",
+                    "set",
+                    trace_id, 
+                    request_id, 
+                    "PROCESSING_C",
+                    "processing in service-c"
+                )
             time.sleep(random.randint(1, 3))
 
             # ---------------- FAILURE SIMULATION ----------------
-            should_fail = random.randint(1, 10) > 8
+            should_fail = random.randint(1, 10) > 5
 
             if should_fail:
+                log_event(
+                    "info",
+                    "service-c",
+                    "processing",
+                    trace_id,
+                    request_id,
+                    f"should_fail={should_fail}",
+                    "should_fail value > 5, simulating failure in service-c"
+                )
+
                 retry_count = increment_retry(request_id)
 
-                state = "FAILED_C"
-                log_event("error", trace_id, request_id, state,
-                          f"retry {retry_count}/{MAX_RETRIES}")
+                retry_count_metric.labels("service-c").inc()
 
-                persist_event(trace_id, request_id, state,
-                              f"failed retry {retry_count}")
+                state = "FAILED_C"
+
+                with tracer.start_as_current_span("redis.set"):
+                    r.set(f"workflow:{request_id}", state, ex=3600)
+                    log_event(
+                        "info", 
+                        "redis",
+                        "set",
+                        trace_id, 
+                        request_id, 
+                        state,
+                        f"retry {retry_count}/{MAX_RETRIES}"
+                    )
+
+                """ with tracer.start_as_current_span("db.persist"):
+                        persist_event(
+                            trace_id, 
+                            request_id, 
+                            state,
+                            f"retry {retry_count}/{MAX_RETRIES}"
+                        ) """
 
                 if retry_count <= MAX_RETRIES:
 
-                    headers = properties.headers.copy() if properties and properties.headers else {}
-                    inject(headers)
-
-                    ch.basic_publish(
-                        exchange="",
-                        routing_key="workflow_queue_c",
-                        body=json.dumps(message),
-                        properties=pika.BasicProperties(headers=headers)
-                    )
+                    publish_message(
+                        ch,
+                        "workflow_queue_c",
+                        message,
+                        trace_id,
+                        request_id,
+                        properties.headers,
+                        "FAILED_C",
+                        f"Failed in service-c, retrying {retry_count}/{MAX_RETRIES}"
+                     )
 
                 else:
-                    send_to_dlq(ch, message)
-                    log_event("error", trace_id, request_id,
-                              "DLQ_C", "max retries exceeded")
-
+                    workflow_transitions.labels("service-c", "ERRORED_C").inc()
+                    send_to_dlq(ch, message, trace_id, request_id, properties.headers)
                 return
 
             # ---------------- EXTERNAL API ----------------
-            try:
-                response = requests.get(
-                    "http://external-api:8003/process",
-                    params={"request_id": request_id},
-                    timeout=2
-                )
+            with tracer.start_as_current_span(
+                "http.client.external_api",
+                kind=SpanKind.CLIENT
+            ) as api_span:
+                api_span.set_attribute("http.method", "GET")
+                api_span.set_attribute("http.url", "http://external-api:8003/process")
+                api_span.set_attribute("request_id", request_id)
 
-                if response.status_code == 200 and response.json().get("status") == "SUCCESS":
-                    state = "COMPLETED_C"
-                    msg = "external API success"
-                    level = "info"
-                else:
+                try:
+                    response = requests.get(
+                        "http://external-api:8003/process",
+                        params={"request_id": request_id},
+                        timeout=2
+                    )
+
+                    api_span.set_attribute("http.status_code", response.status_code)
+
+                    if response.status_code == 200 and response.json().get("status") == "SUCCESS":
+                        state = "COMPLETED_C"
+                        msg = "external API success"
+                        level = "info"
+                    else:
+                        state = "FAILED_C"
+                        msg = "external API failed"
+                        level = "error"
+
+                except Exception as e:
                     state = "FAILED_C"
-                    msg = "external API failed"
+                    msg = str(e)
                     level = "error"
-
-            except Exception as e:
-                state = "ERRORED_C"
-                msg = str(e)
-                level = "error"
+                    api_span.record_exception(e)
+                    api_span.set_status(Status(StatusCode.ERROR, msg))
 
             # ---------------- FINAL UPDATE ----------------
-            r.set(f"workflow:{request_id}", state, ex=3600)
+            with tracer.start_as_current_span("redis.set"):
+                r.set(f"workflow:{request_id}", state, ex=3600)
+                log_event(
+                    level,
+                    "redis",
+                    "set",
+                    trace_id, 
+                    request_id,
+                    state, 
+                    msg
+                )
 
-            log_event(level, trace_id, request_id, state, msg)
+            with tracer.start_as_current_span("db.persist"):
+                persist_event(
+                    trace_id, 
+                    request_id, 
+                    state, 
+                    msg
+                )
 
-            persist_event(trace_id, request_id, state, msg)
+            workflow_transitions.labels("service-c", state).inc()
 
             r.expire(f"workflow:{request_id}", 3600)
 

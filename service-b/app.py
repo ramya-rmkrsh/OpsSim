@@ -23,6 +23,9 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.propagate import inject, extract
 from opentelemetry.trace import SpanKind
 
+from prometheus_client import Counter, Histogram, start_http_server
+start_http_server(9100) # Start Prometheus metrics server on port 9100
+
 # ----------------------------
 # Auto instrumentation
 # ----------------------------
@@ -141,16 +144,64 @@ def heartbeat_loop():
 # ----------------------------
 # Logging helper
 # ----------------------------
-def log_event(level, trace_id, request_id, state, message):
+def log_event(level, component, operation, trace_id, request_id, state, message):
     log_data = {
+        "level": level,
         "timestamp": datetime.utcnow().isoformat(),
-        "trace_id": trace_id,
-        "request_id": request_id,
         "service": "service-b",
+        "component": component,
+        "operation": operation,
         "state": state,
-        "message": message
+        "message": message,
+        "trace_id": trace_id,
+        "request_id": request_id
     }
     print(json.dumps(log_data), flush=True)
+
+#----------------------------
+# Prometheus Metrics
+#----------------------------
+workflow_transitions = Counter(
+    "opssim_workflow_transitions_total", "Count of workflow state transitions",
+    ["service", "state"]
+)
+retry_count_metric = Counter(
+    "opssim_retries_total", "Retry attempts", ["service"]
+)
+
+#----------------------------
+# RabbitMQ Publish with Tracing
+#----------------------------
+
+def publish_message(channel, routing_key, message, trace_id, request_id, existing_headers=None, state=None, log_message=None):
+    with tracer.start_as_current_span(
+        "rmq.publish",
+        kind=SpanKind.PRODUCER
+    ) as span:
+        span.set_attribute("messaging.system", "rabbitmq")
+        span.set_attribute("messaging.destination", routing_key)
+        span.set_attribute("messaging.operation", "publish")
+        span.set_attribute("request_id", request_id)
+
+        headers = existing_headers.copy() if existing_headers else {}
+        inject(headers)  # inject AFTER span is active so it propagates the publish span, not the consume span
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=routing_key,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(headers=headers)
+        )
+
+        log_event(
+            "info",
+            "rmq", 
+            "publish", 
+            trace_id, 
+            request_id,
+            state,
+            log_message
+        )
 
 # ----------------------------
 # Persist event
@@ -166,9 +217,26 @@ def persist_event(trace_id, request_id, state, message):
             service_name,
             state,
             message
-        ) VALUES (%s, %s, %s, %s, %s)
-    """, (trace_id, request_id, "service-b", state, message))
+        )
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        trace_id,
+        request_id,
+        "service-b",
+        state,
+        message
+    ))
 
+    log_event(
+        "info",
+        "db",
+        "insert",
+        trace_id, 
+        request_id, 
+        state,
+        message
+    ) 
+   
     conn.commit()
     cur.close()
     conn.close()
@@ -176,13 +244,14 @@ def persist_event(trace_id, request_id, state, message):
 # ----------------------------
 # Retry
 # ----------------------------
-MAX_RETRIES = 3
-RETRY_KEY_PREFIX = "retry:"
+MAX_RETRIES = 5
+RETRY_KEY_PREFIX = "retry:service-b:"
 
 def get_retry_count(request_id):
     return int(r.get(f"{RETRY_KEY_PREFIX}{request_id}") or 0)
 
 def increment_retry(request_id):
+    retry_count_metric.labels("service-b").inc()
     count = get_retry_count(request_id) + 1
     r.set(f"{RETRY_KEY_PREFIX}{request_id}", count, ex=3600)
     return count
@@ -190,15 +259,24 @@ def increment_retry(request_id):
 # ----------------------------
 # DLQ
 # ----------------------------
-def send_to_dlq(channel, message):
-    headers = {}
-    inject(headers)
+def send_to_dlq(channel, message, trace_id, request_id, existing_headers):
 
-    channel.basic_publish(
-        exchange="",
-        routing_key="workflow_dlq",
-        body=json.dumps(message),
-        properties=pika.BasicProperties(headers=headers)
+    persist_event(
+        trace_id,
+        request_id,
+        "FAILED_B",
+        "Message sent to DLQ"
+    )
+
+    publish_message(
+        channel,
+        "workflow_dlq", 
+        message, 
+        trace_id, 
+        request_id,
+        existing_headers,
+        "FAILED_B"
+        "Message sent to DLQ"
     )
 
 # ----------------------------
@@ -234,62 +312,102 @@ def callback(ch, method, properties, body):
 
             trace_id = format(span.get_span_context().trace_id, "032x")
 
-            log_event("info", trace_id, request_id,
-                      "PROCESSING_B", "message received")
-
-            # ---------------- DB SPAN ----------------
-            with tracer.start_as_current_span("db.persist"):
-                persist_event(trace_id, request_id,
-                              "PROCESSING_B",
-                              "stored event in service-b")
-
             # ---------------- REDIS SPAN ----------------
             with tracer.start_as_current_span("redis.set"):
                 r.set(f"workflow:{request_id}", "PROCESSING_B", ex=3600)
-
+                log_event(
+                    "info",
+                    "redis",
+                    "set",
+                    trace_id, 
+                    request_id, 
+                    "PROCESSING_B",
+                    "updated state in redis to PROCESSING_B"
+                )
             time.sleep(random.randint(1, 3))
 
             # ---------------- FAILURE SIMULATION ----------------
-            should_fail = random.randint(1, 10) > 8
+            should_fail = random.randint(1, 10) > 6
 
             if should_fail:
+                log_event(
+                    "info",
+                    "service-b",
+                    "processing",
+                    trace_id,
+                    request_id,
+                    f"should_fail={should_fail}",
+                    "should_fail value > 6, simulating failure in service-b"
+                )
 
                 retry_count = increment_retry(request_id)
 
+                retry_count_metric.labels("service-b").inc()
+
                 state = "FAILED_B"
 
-                log_event("error", trace_id, request_id, state,
-                          f"retry {retry_count}/{MAX_RETRIES}")
+                with tracer.start_as_current_span("redis.set"):
+                    r.set(f"workflow:{request_id}", state, ex=3600)
+                    log_event(
+                        "info",
+                        "redis",
+                        "set",
+                        trace_id, 
+                        request_id, 
+                        state,
+                        f"retry {retry_count}/{MAX_RETRIES}"
+                    )
 
-                persist_event(trace_id, request_id, state,
-                              "failure in service-b")
+                """ with tracer.start_as_current_span("db.persist"):
+                    persist_event(
+                        trace_id, 
+                        request_id, 
+                        state,
+                        f"retry {retry_count}/{MAX_RETRIES}"
+                    ) """
 
                 if retry_count <= MAX_RETRIES:
 
-                    headers = properties.headers.copy() if properties and properties.headers else {}
-                    inject(headers)
-
-                    ch.basic_publish(
-                        exchange="",
-                        routing_key="workflow_queue_b",
-                        body=json.dumps(message),
-                        properties=pika.BasicProperties(headers=headers)
+                    publish_message(
+                        ch,
+                        "workflow_queue_b",
+                        message,
+                        trace_id,
+                        request_id,
+                        properties.headers,
+                        "FAILED_B",
+                        f"Failed in service-b, retrying {retry_count}/{MAX_RETRIES}"
                     )
 
-                else:
-                    send_to_dlq(ch, message)
+                    r.expire(f"workflow:{request_id}", 3600)
 
+                else:
+                    workflow_transitions.labels("service-b", "DLQ").inc()
+                    send_to_dlq(ch, message, trace_id, request_id, properties.headers)
                 return
 
             # ---------------- SUCCESS PATH ----------------
-            r.set(f"workflow:{request_id}", "COMPLETED_B", ex=3600)
+            with tracer.start_as_current_span("redis.set"):
+                r.set(f"workflow:{request_id}", "COMPLETED_B", ex=3600)
+                log_event(
+                    "info",
+                    "redis",
+                    "set",
+                    trace_id, 
+                    request_id,
+                    "COMPLETED_B", 
+                    "completed in service-b"
+                )
 
-            log_event("info", trace_id, request_id,
-                      "COMPLETED_B", "completed in service-b")
+            with tracer.start_as_current_span("db.persist"):
+                persist_event(
+                    trace_id, 
+                    request_id,
+                    "COMPLETED_B",
+                    "success in service-b"
+                )
 
-            persist_event(trace_id, request_id,
-                          "COMPLETED_B",
-                          "success in service-b")
+            workflow_transitions.labels("service-b", "COMPLETED_B").inc()
 
             # ---------------- SEND TO C ----------------
             next_message = {
@@ -299,18 +417,16 @@ def callback(ch, method, properties, body):
                 "timestamp": datetime.utcnow().isoformat()
             }
 
-            headers = properties.headers.copy() if properties and properties.headers else {}
-            inject(headers)
-
-            ch.basic_publish(
-                exchange="",
-                routing_key="workflow_queue_c",
-                body=json.dumps(next_message),
-                properties=pika.BasicProperties(headers=headers)
+            publish_message(
+                ch, 
+                "workflow_queue_c", 
+                next_message, 
+                trace_id, 
+                request_id, 
+                properties.headers,
+                "PROCESSING_C",
+                "forwarded to service-c"
             )
-
-            log_event("info", trace_id, request_id,
-                      "PUBLISHED_TO_C", "sent to service-c")
 
 # ----------------------------
 # RabbitMQ connection

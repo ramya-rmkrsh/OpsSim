@@ -26,7 +26,11 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.trace import get_current_span
 from opentelemetry.propagate import inject #to propagate trace context in RabbitMQ messages
 
+from prometheus_client import Counter, Histogram, make_asgi_app
+
 app = FastAPI()
+
+app.mount("/metrics", make_asgi_app())
 
 # one line each — auto-instruments everything
 Instrumentator().instrument(app).expose(app)
@@ -107,18 +111,34 @@ def connect_rabbitmq():
 # ----------------------------
 # Structured Logging Helper
 # ----------------------------
-def log_event(level, trace_id, request_id, state, message):
+def log_event(level, component, operation, trace_id, request_id, state, message):
 
     log_data = {
+        "level": level,
         "timestamp": datetime.utcnow().isoformat(),
-        "trace_id": trace_id,
-        "request_id": request_id,
         "service": "service-a",
+        "component": component,
+        "operation": operation,
         "state": state,
-        "message": message
+        "message": message,
+        "trace_id": trace_id,
+        "request_id": request_id
     }
 
     print(json.dumps(log_data), flush=True)
+
+#----------------------------
+# Prometheus Metrics
+#----------------------------
+
+workflow_transitions = Counter(
+    "opssim_workflow_transitions_total", "Count of workflow state transitions",
+    ["service", "state"]
+)
+workflow_duration = Histogram(
+    "opssim_workflow_stage_duration_seconds", "Time spent in each stage",
+    ["service", "operation"]
+)
 
 # ----------------------------
 # Persist Workflow Event
@@ -146,8 +166,17 @@ def persist_event(trace_id, request_id, state, message):
         message
     ))
 
+    log_event(
+        "info", 
+        "db" , 
+        "insert", 
+        trace_id, 
+        request_id, 
+        state, 
+        message
+    )
+    
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -288,7 +317,6 @@ def workflow_history(request_id: str):
 FINAL_STATES = [
     "FAILED_B",
     "FAILED_C",
-    "ERRORED_C",
     "COMPLETED_C"
 ]
 
@@ -323,33 +351,37 @@ def work():
         with tracer.start_as_current_span("workflow.start") as span:
 
             request_id = str(uuid.uuid4())
-
-            trace_id = format(
-                span.get_span_context().trace_id,
-                "032x"
-            )
+            span = trace.get_current_span()
+            trace_id = format(span.get_span_context().trace_id,"032x")
+            span_id = format(span.get_span_context().span_id, "016x")
 
         # workflow started
         r.set(f"workflow:{request_id}", "PROCESSING_A", ex=3600)
          
         log_event(
-            level="info",
-            trace_id=trace_id,
-            request_id=request_id,
-            state="PROCESSING_A",
-            message="workflow received"
-        )
-
-        persist_event(
+            "info",
+            "redis",
+            "set",
             trace_id,
             request_id,
             "PROCESSING_A",
-            "workflow received"
+            "workflow started at service-a"
         )
+
+        # persist_event(
+        #     trace_id,
+        #     request_id,
+        #     "PROCESSING_A",
+        #     "workflow received at service-a"
+        # ) 
+
+        # increment Prometheus counter for workflow transition to PROCESSING_A
+        workflow_transitions.labels("service-a", "PROCESSING_A").inc()
 
         # publish event to RabbitMQ
         message = {
             "trace_id": trace_id,
+            "span_id":span_id,
             "request_id": request_id,
             "state": "PROCESSING_B",
             "timestamp": datetime.utcnow().isoformat()
@@ -372,19 +404,24 @@ def work():
         )
 
         log_event(
-            level="info",
-            trace_id=trace_id,
-            request_id=request_id,
-            state="PUBLISHED_TO_B",
-            message="event published to workflow_queue_b"
-        )
-
-        persist_event(
+            "info",
+            "rmq",
+            "publish",
             trace_id,
             request_id,
             "PUBLISHED_TO_B",
             "event published to workflow_queue_b"
         )
+
+        # persist_event(
+        #     trace_id,
+        #     request_id,
+        #     "PUBLISHED_TO_B",
+        #     "event published to workflow_queue_b"
+        # )
+
+        # increment Prometheus counter for workflow transition to PUBLISHED_TO_B
+        workflow_transitions.labels("service-a", "PUBLISHED_TO_B").inc()
 
         connection.close() # ensure rmq connection is closed after publishing
 

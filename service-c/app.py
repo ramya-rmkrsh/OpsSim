@@ -395,7 +395,7 @@ def callback(ch, method, properties, body):
                      )
 
                 else:
-                    workflow_transitions.labels("service-c", "ERRORED_C").inc()
+                    workflow_transitions.labels("service-c", "FAILED_C").inc()
                     send_to_dlq(ch, message, trace_id, request_id, properties.headers)
                 return
 

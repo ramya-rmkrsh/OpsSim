@@ -1,4 +1,5 @@
 # OpsSim
+Version: 2.0.0
 
 A containerized event-driven microservice pipeline built to simulate and observe real-world operational workflows. Designed as a portfolio project demonstrating support engineering skills: fault tolerance, distributed tracing, retry logic, dead letter queues, infrastructure health checks, full-stack observability, and CI pipeline design.
 

@@ -92,9 +92,10 @@ Each service moves a request through its own states in Redis (live status) and, 
 
 **Terminal states:** `FAILED_B`, `FAILED_C`, `COMPLETED_C` — these are the only states the `/result/{request_id}` endpoint recognizes as workflow-complete (see `FINAL_STATES` in service-a). `COMPLETED_B` is **not** terminal — it marks a successful hand-off from service-b to service-c, and the workflow keeps going.
 
-**What gets persisted to Postgres:** `COMPLETED_C` and the three terminal outcomes. Redis holds live/in-flight state (including retry attempts); Postgres records the hand-off to service-c and how each workflow finally ended.
+**What gets persisted to Postgres:** `COMPLETED_C` and the three terminal outcomes. Redis holds live/in-flight state (including retry attempts); Postgres records the hand-off to service-c and how each workflow finally ended. 
 
-Failures are captured as FAILED_B / FAILED_C with a message describing the specific cause (DLQ, external API failure, exception) — the state name tells you which service and that it failed; the message tells you why.
+Failures are captured as state FAILED_B / FAILED_C with a message describing the specific cause (DLQ, external API failure, exception) - the state name tells you which service and the reason why it failed
+
 ---
 
 ## Services
